@@ -1,111 +1,126 @@
+# api/shopping.py
 from http.server import BaseHTTPRequestHandler
-import json, os, re, urllib.request, urllib.parse
+import json, urllib.request, urllib.parse, os
 
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
+SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
 
-def _clean(s): return (s or "").strip()
+def _get(url, timeout=12):
+    req = urllib.request.Request(url, headers={'User-Agent': 'UPC-Price-Finder/1.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8', errors='ignore'))
+
+def _ok(handler, data):
+    handler.send_response(200)
+    handler.send_header('Content-type', 'application/json')
+    handler.send_header('Access-Control-Allow-Origin', '*')
+    handler.end_headers()
+    handler.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+def _err(handler, code, msg):
+    handler.send_response(code)
+    handler.send_header('Content-type', 'application/json')
+    handler.send_header('Access-Control-Allow-Origin', '*')
+    handler.end_headers()
+    handler.wfile.write(json.dumps({'error': msg}, ensure_ascii=False).encode('utf-8'))
 
 class handler(BaseHTTPRequestHandler):
-    def _ok(self, data):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
-
-    def _err(self, code, msg):
-        self.send_response(code)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps({"error": msg}, ensure_ascii=False).encode("utf-8"))
-
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
     def do_POST(self):
+        if not SERPAPI_KEY:
+            return _err(self, 500, 'API Key no configurada')
         try:
-            if not SERPAPI_KEY:
-                return self._err(500, "API Key no configurada")
+            body_len = int(self.headers.get('Content-Length', 0))
+            payload = json.loads(self.rfile.read(body_len).decode('utf-8'))
+            # query puede ser nombre de producto o UPC
+            query = (payload.get('query') or '').strip()
+            hl = payload.get('hl', 'es')
+            gl = payload.get('gl', 'mx')
+            domain = payload.get('domain', 'google.com.mx')
+            if not query:
+                return _err(self, 400, 'query es requerido')
 
-            ln = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(ln)
-            data = json.loads(body.decode("utf-8"))
+            # 1) Buscar en "Google Shopping" (tbm=shop) para obtener product_id / sellers rápidos
+            params_shop = urllib.parse.urlencode({
+                'engine': 'google',
+                'q': query,
+                'api_key': SERPAPI_KEY,
+                'hl': hl, 'gl': gl, 'google_domain': domain,
+                'tbm': 'shop',  # shopping vertical
+                'num': '20'
+            })
+            shop_url = f'https://serpapi.com/search.json?{params_shop}'
+            shop = _get(shop_url)
 
-            # Puedes mandar 'query' (nombre comercial) o 'upc'
-            query = _clean(data.get("query") or "")
-            upc = _clean(data.get("upc") or "")
+            offers = []
 
-            hl = _clean(data.get("hl") or "es")
-            gl = _clean(data.get("gl") or "mx")
-            domain = _clean(data.get("domain") or "google.com.mx")
+            # 1a) Si algunos resultados ya traen precio + tienda, úsalo
+            for it in (shop.get('shopping_results') or []):
+                title = it.get('title') or ''
+                link  = it.get('link') or ''
+                store = it.get('source') or ''  # nombre de la tienda
+                price = it.get('extracted_price') or it.get('price')  # SerpAPI ya lo extrae a veces
+                currency = it.get('currency') or 'MXN'
+                if link and (price or store):
+                    offers.append({
+                        'title': title, 'seller': store, 'price': price,
+                        'currency': currency, 'link': link, 'origin': 'shopping_results'
+                    })
 
-            q = query or upc
-            if not q:
-                return self._err(400, "Se requiere 'query' o 'upc'")
+            # 1b) Si hay product_id, usa "google_product" para listar sellers
+            product_ids = [it.get('product_id') for it in (shop.get('shopping_results') or []) if it.get('product_id')]
+            seen_links = set(o['link'] for o in offers if o.get('link'))
+            for pid in product_ids[:2]:  # limita para costos
+                params_prod = urllib.parse.urlencode({
+                    'engine': 'google_product',
+                    'api_key': SERPAPI_KEY,
+                    'product_id': pid,
+                    'hl': hl, 'gl': gl, 'google_domain': domain
+                })
+                prod_url = f'https://serpapi.com/search.json?{params_prod}'
+                prod = _get(prod_url)
 
-            # 1) Buscar en Google Shopping para obtener product_id
-            params1 = {
-                "engine": "google_shopping",
-                "q": q,
-                "api_key": SERPAPI_KEY,
-                "hl": hl, "gl": gl, "google_domain": domain,
-                "num": "10"
-            }
-            url1 = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params1)
-            req1 = urllib.request.Request(url1, headers={"User-Agent": "UPC-Price-Finder/1.0"})
-            with urllib.request.urlopen(req1, timeout=12) as resp1:
-                data1 = json.loads(resp1.read().decode("utf-8", errors="ignore"))
+                # sellers_results → lista de tiendas con precio
+                for s in (prod.get('sellers_results') or []):
+                    store = s.get('name') or s.get('seller') or ''
+                    price = s.get('extracted_price') or s.get('price')
+                    currency = s.get('currency') or 'MXN'
+                    link = s.get('link') or s.get('product_link') or ''
+                    title = (prod.get('product_results') or {}).get('title') or (s.get('title') or '')
+                    if link and link not in seen_links:
+                        offers.append({
+                            'title': title, 'seller': store, 'price': price,
+                            'currency': currency, 'link': link, 'origin': 'google_product'
+                        })
+                        seen_links.add(link)
 
-            # intenta tomar un product_id de shopping_results / product_results
-            product_id = None
-            for it in (data1.get("shopping_results") or []):
-                if it.get("product_id"):
-                    product_id = it["product_id"]; break
-            if not product_id:
-                for it in (data1.get("product_results") or []):
-                    if it.get("product_id"):
-                        product_id = it["product_id"]; break
-
-            # Si no hubo product_id, al menos devuelve shopping_results “plan B”
-            if not product_id:
-                return self._ok({
-                    "type": "shopping_results",
-                    "items": data1.get("shopping_results") or []
+            # Normaliza: filtra precios no válidos, limita tamaño
+            norm = []
+            for o in offers:
+                p = o.get('price')
+                try:
+                    if isinstance(p, str):  # "MXN$172.00"
+                        import re
+                        m = re.search(r'(\d+(?:[.,]\d{2})?)', p)
+                        p = float(m.group(1).replace(',', '.')) if m else None
+                    p = float(p) if p is not None else None
+                except:
+                    p = None
+                norm.append({
+                    'title': o.get('title') or '',
+                    'seller': o.get('seller') or '',
+                    'price': p,
+                    'currency': o.get('currency') or 'MXN',
+                    'link': o.get('link') or '',
+                    'origin': o.get('origin')
                 })
 
-            # 2) Con product_id, pedir el panel de producto (sellers_results)
-            params2 = {
-                "engine": "google_product",
-                "product_id": product_id,
-                "api_key": SERPAPI_KEY,
-                "hl": hl, "gl": gl, "google_domain": domain
-            }
-            url2 = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params2)
-            req2 = urllib.request.Request(url2, headers={"User-Agent": "UPC-Price-Finder/1.0"})
-            with urllib.request.urlopen(req2, timeout=12) as resp2:
-                data2 = json.loads(resp2.read().decode("utf-8", errors="ignore"))
+            return _ok(self, { 'query': query, 'offers': norm[:40] })
 
-            # Estructura final
-            out = {
-                "type": "product_offers",
-                "product": {
-                    "title": (data2.get("title") or data1.get("search_metadata", {}).get("id") or ""),
-                    "product_id": product_id,
-                    "source": "google_product"
-                },
-                "offers": data2.get("sellers_results") or []
-            }
-            return self._ok(out)
-
-        except json.JSONDecodeError:
-            return self._err(400, "JSON inválido")
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            return self._err(e.code, f"SerpAPI HTTP {e.code}: {body[:200]}")
         except Exception as e:
-            return self._err(500, f"Error: {str(e)}")
+            return _err(self, 500, f'Error: {e}')
