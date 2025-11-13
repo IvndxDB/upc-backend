@@ -14,15 +14,6 @@ if GEMINI_API_KEY:
 # Límites de validación
 PRICE_MIN = 10
 PRICE_MAX = 10000
-VALID_COUNTRIES = ['mx', 'com.mx']
-
-def _is_mexican_domain(url: str) -> bool:
-    """Verifica si es un dominio mexicano"""
-    try:
-        domain = url.lower()
-        return any(country in domain for country in VALID_COUNTRIES)
-    except:
-        return False
 
 def _validate_price(price) -> bool:
     """Valida que el precio esté en rango razonable"""
@@ -35,9 +26,7 @@ def _validate_price(price) -> bool:
         return False
 
 def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
-    """
-    Scrapea resultados de Google Shopping
-    """
+    """Scrapea resultados de Google Shopping"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -51,7 +40,7 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
         
         params = {
             'q': query,
-            'tbm': 'shop',  # Shopping tab
+            'tbm': 'shop',
             'hl': hl,
             'gl': gl
         }
@@ -68,27 +57,23 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
         
         for product in product_divs[:30]:
             try:
-                # Título del producto
                 title_elem = product.find(['h3', 'h4', 'a'])
                 title = title_elem.get_text(strip=True) if title_elem else ''
                 
-                # Link
                 link_elem = product.find('a', href=True)
                 link = link_elem.get('href', '') if link_elem else ''
                 if link and not link.startswith('http'):
                     link = 'https://www.google.com' + link
                 
-                # Precio
                 price_elem = product.find(['span', 'b'], class_=re.compile(r'.*price.*', re.I))
                 if not price_elem:
                     price_elem = product.find(['span', 'b'], string=re.compile(r'[$€£]\s*[\d,\.]+'))
                 price_text = price_elem.get_text(strip=True) if price_elem else ''
                 
-                # Vendedor/Tienda
                 seller_elem = product.find(['div', 'span'], class_=re.compile(r'.*seller.*|.*store.*|.*merchant.*', re.I))
                 seller = seller_elem.get_text(strip=True) if seller_elem else ''
                 
-                # NUEVO: Aceptar TODOS los resultados
+                # ACEPTAR TODO
                 if title and link:
                     results.append({
                         'title': title,
@@ -99,7 +84,7 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
             except Exception as e:
                 continue
         
-        # Si no encontramos resultados con la estructura anterior
+        # Fallback
         if not results:
             all_links = soup.find_all('a', href=re.compile(r'/shopping/product/'))
             for link_elem in all_links[:20]:
@@ -109,7 +94,6 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
                     if link and not link.startswith('http'):
                         link = 'https://www.google.com' + link
                     
-                    # NUEVO: Aceptar todos
                     if title and len(title) > 5:
                         results.append({
                             'title': title,
@@ -126,13 +110,10 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
         return []
 
 def _analyze_shopping_with_gemini(query: str, shopping_results: list) -> dict:
-    """
-    Usa Gemini para analizar resultados de shopping y extraer ofertas estructuradas
-    """
+    """Usa Gemini para analizar resultados de shopping"""
     try:
         model = genai.GenerativeModel('gemini-2.0-flash-exp')
         
-        # Preparar contexto
         context = f"""Analiza los siguientes resultados de Google Shopping para: "{query}"
 
 Productos encontrados:
@@ -156,16 +137,15 @@ Para cada producto:
 4. **Identifica el vendedor/tienda** del sitio web
 5. **Incluye el link**
 
-REGLAS CRÍTICAS PARA PRECIOS:
+REGLAS PARA PRECIOS:
 - Precio MÍNIMO: ${PRICE_MIN} MXN
 - Precio MÁXIMO: ${PRICE_MAX} MXN
-- Si ves "$2.00" o "$7.00", probablemente es PRECIO POR UNIDAD - ignóralo o busca el precio total
+- Si ves "$2.00" o "$7.00", probablemente es PRECIO POR UNIDAD - ignóralo
 - Si ves descuentos del 98%, probablemente es un error - ignóralo
 - SOLO incluye precios que parezcan razonables para el producto
 - Si el precio no es claro, déjalo como null
-- SOLO incluye productos de sitios mexicanos (.mx o .com.mx)
 
-FORMATO:
+FORMATO (JSON válido sin markdown):
 {{
   "query": "{query}",
   "offers": [
@@ -189,7 +169,7 @@ FORMATO:
 
 IMPORTANTE:
 - Responde SOLO con JSON válido, sin markdown ni texto adicional
-- Solo incluye productos reales en venta con precios válidos
+- Incluye TODOS los productos con información relevante
 - Si hay múltiples ofertas del mismo producto, inclúyelas todas
 - Calcula el price_range solo con precios válidos"""
 
@@ -201,7 +181,7 @@ IMPORTANTE:
         
         parsed = json.loads(result_text)
         
-        # NUEVO: Validación PERMISIVA
+        # Validación MÍNIMA
         validated_offers = []
         for offer in parsed.get('offers', []):
             # Solo validar campos mínimos
@@ -213,13 +193,12 @@ IMPORTANTE:
             if price is not None and not _validate_price(price):
                 continue
             
-            # ACEPTAR TODO (sin filtro de dominio)
             validated_offers.append(offer)
         
         parsed['offers'] = validated_offers
         parsed['total_offers'] = len(validated_offers)
         
-        # Recalcular price_range con ofertas validadas
+        # Recalcular price_range
         if validated_offers:
             valid_prices = [o['price'] for o in validated_offers if o.get('price') is not None]
             if valid_prices:
@@ -234,7 +213,6 @@ IMPORTANTE:
         
     except Exception as e:
         print(f"Error con Gemini en shopping: {e}")
-        # Fallback
         return {
             'query': query,
             'offers': [
@@ -245,7 +223,7 @@ IMPORTANTE:
                     'seller': r.get('seller', ''),
                     'link': r['link']
                 }
-                for r in shopping_results[:20]  # ACEPTAR TODOS
+                for r in shopping_results[:20]
             ],
             'total_offers': len(shopping_results),
             'summary': f'Se encontraron {len(shopping_results)} productos para "{query}"'
@@ -288,13 +266,10 @@ class handler(BaseHTTPRequestHandler):
             analyzed_data['search_engine'] = 'google_shopping_scraping'
             analyzed_data['powered_by'] = 'gemini-2.0-flash'
             analyzed_data['raw_count'] = len(shopping_results)
-            
-            # NUEVO: Estadísticas de validación
             analyzed_data['validation'] = {
                 'total_scraped': len(shopping_results),
                 'total_validated': len(analyzed_data.get('offers', [])),
-                'price_range_filter': f'{PRICE_MIN}-{PRICE_MAX} MXN',
-                'country_filter': 'MX'
+                'price_range_filter': f'{PRICE_MIN}-{PRICE_MAX} MXN'
             }
 
             return self._send_success(analyzed_data)
