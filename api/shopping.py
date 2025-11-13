@@ -13,7 +13,7 @@ if GEMINI_API_KEY:
 
 # Límites de validación
 PRICE_MIN = 10
-PRICE_MAX = 10000
+PRICE_MAX = 100000
 
 def _validate_price(price) -> bool:
     """Valida que el precio esté en rango razonable"""

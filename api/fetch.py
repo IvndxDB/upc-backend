@@ -15,7 +15,7 @@ if GEMINI_API_KEY:
 
 # Límites de validación
 PRICE_MIN = 10
-PRICE_MAX = 10000
+PRICE_MAX = 100000
 
 PRICE_PATTERNS = [
     r'"offers"\s*:\s*{[^}]*?"price"\s*:\s*"?([0-9.,]+)"?',
