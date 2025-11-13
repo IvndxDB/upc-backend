@@ -13,7 +13,7 @@ if GEMINI_API_KEY:
 
 # Límites de validación
 PRICE_MIN = 10
-PRICE_MAX = 10000
+PRICE_MAX = 100000
 
 # NUEVO: Dominios mexicanos conocidos (más flexible)
 MEXICAN_DOMAINS = ['mx', 'com.mx']
