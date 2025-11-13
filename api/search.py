@@ -100,8 +100,8 @@ def _scrape_google_search(query: str, num: int = 20, hl: str = 'es', gl: str = '
                 snippet_elem = result.find('div', class_=['VwiC3b', 'yXK7lf'])
                 snippet = snippet_elem.get_text() if snippet_elem else ''
                 
-                # MEJORADO: Aceptar si es dominio válido (mx O retailer conocido)
-                if title and link and _is_valid_domain(link):
+                # NUEVO: Aceptar TODOS los resultados, dejar que Gemini filtre
+                if title and link:
                     results.append({
                         'title': title,
                         'link': link,
@@ -169,22 +169,19 @@ Responde SOLO con JSON, sin texto adicional."""
         
         parsed = json.loads(result_text)
         
-        # Validación post-Gemini (menos estricta)
+        # NUEVO: Validación MÁS PERMISIVA (solo rechaza basura obvia)
         validated_products = []
         for product in parsed.get('products', []):
-            # Validar dominio válido
-            if not _is_valid_domain(product.get('link', '')):
+            # Solo validar que tenga campos mínimos
+            if not product.get('title') or not product.get('link'):
                 continue
             
-            # Validar precio (si existe)
+            # Validar precio solo si existe (permitir null)
             price = product.get('price')
             if price is not None and not _validate_price(price):
                 continue
             
-            # Validar campos requeridos
-            if not product.get('title') or not product.get('link'):
-                continue
-            
+            # ACEPTAR TODO LO DEMÁS (sin filtro de dominio aquí)
             validated_products.append(product)
         
         parsed['products'] = validated_products
@@ -194,7 +191,7 @@ Responde SOLO con JSON, sin texto adicional."""
         
     except Exception as e:
         print(f"Error con Gemini: {e}")
-        # Fallback
+        # Fallback - ACEPTAR TODOS
         return {
             'products': [
                 {
@@ -205,8 +202,7 @@ Responde SOLO con JSON, sin texto adicional."""
                     'link': r['link'],
                     'snippet': r['snippet']
                 }
-                for r in search_results[:10]
-                if _is_valid_domain(r.get('link', ''))
+                for r in search_results[:15]  # Más resultados
             ],
             'total_found': len(search_results),
             'query_type': 'search',

@@ -88,8 +88,8 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
                 seller_elem = product.find(['div', 'span'], class_=re.compile(r'.*seller.*|.*store.*|.*merchant.*', re.I))
                 seller = seller_elem.get_text(strip=True) if seller_elem else ''
                 
-                # Solo agregar si es dominio mexicano
-                if title and link and _is_mexican_domain(link):
+                # NUEVO: Aceptar TODOS los resultados
+                if title and link:
                     results.append({
                         'title': title,
                         'price_text': price_text,
@@ -109,7 +109,8 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
                     if link and not link.startswith('http'):
                         link = 'https://www.google.com' + link
                     
-                    if title and len(title) > 5 and _is_mexican_domain(link):
+                    # NUEVO: Aceptar todos
+                    if title and len(title) > 5:
                         results.append({
                             'title': title,
                             'price_text': '',
@@ -200,21 +201,19 @@ IMPORTANTE:
         
         parsed = json.loads(result_text)
         
-        # VALIDACIÓN ROBUSTA post-Gemini
+        # NUEVO: Validación PERMISIVA
         validated_offers = []
         for offer in parsed.get('offers', []):
-            # Validar precio
-            if not _validate_price(offer.get('price')):
-                continue
-            
-            # Validar dominio mexicano
-            if not _is_mexican_domain(offer.get('link', '')):
-                continue
-            
-            # Validar campos requeridos
+            # Solo validar campos mínimos
             if not offer.get('title') or not offer.get('link'):
                 continue
             
+            # Validar precio solo si existe
+            price = offer.get('price')
+            if price is not None and not _validate_price(price):
+                continue
+            
+            # ACEPTAR TODO (sin filtro de dominio)
             validated_offers.append(offer)
         
         parsed['offers'] = validated_offers
@@ -246,8 +245,7 @@ IMPORTANTE:
                     'seller': r.get('seller', ''),
                     'link': r['link']
                 }
-                for r in shopping_results[:20]
-                if _is_mexican_domain(r.get('link', ''))
+                for r in shopping_results[:20]  # ACEPTAR TODOS
             ],
             'total_offers': len(shopping_results),
             'summary': f'Se encontraron {len(shopping_results)} productos para "{query}"'
