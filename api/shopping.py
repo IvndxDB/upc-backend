@@ -11,9 +11,9 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Límites de validación
-PRICE_MIN = 10
-PRICE_MAX = 100000
+# Límites de validación (más flexibles)
+PRICE_MIN = 1
+PRICE_MAX = 200000
 
 def _validate_price(price) -> bool:
     """Valida que el precio esté en rango razonable"""
@@ -40,161 +40,194 @@ def _scrape_google_shopping(query: str, hl: str = 'es', gl: str = 'mx') -> list:
         
         params = {
             'q': query,
-            'tbm': 'shop',
             'hl': hl,
-            'gl': gl
+            'gl': gl,
+            'tbm': 'shop'
         }
         
         url = "https://www.google.com/search"
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'lxml')
+        soup = BeautifulSoup(response.text, 'html.parser')
         results = []
         
-        # Buscar productos en Google Shopping
-        product_divs = soup.find_all('div', class_=['sh-dgr__content', 'sh-dlr__content'])
-        
-        for product in product_divs[:30]:
-            try:
-                title_elem = product.find(['h3', 'h4', 'a'])
-                title = title_elem.get_text(strip=True) if title_elem else ''
-                
-                link_elem = product.find('a', href=True)
-                link = link_elem.get('href', '') if link_elem else ''
-                if link and not link.startswith('http'):
-                    link = 'https://www.google.com' + link
-                
-                price_elem = product.find(['span', 'b'], class_=re.compile(r'.*price.*', re.I))
-                if not price_elem:
-                    price_elem = product.find(['span', 'b'], string=re.compile(r'[$€£]\s*[\d,\.]+'))
-                price_text = price_elem.get_text(strip=True) if price_elem else ''
-                
-                seller_elem = product.find(['div', 'span'], class_=re.compile(r'.*seller.*|.*store.*|.*merchant.*', re.I))
-                seller = seller_elem.get_text(strip=True) if seller_elem else ''
-                
-                # ACEPTAR TODO
-                if title and link:
-                    results.append({
-                        'title': title,
-                        'price_text': price_text,
-                        'seller': seller,
-                        'link': link
-                    })
-            except Exception as e:
+        # Google Shopping blocks
+        for item in soup.select('div.sh-dgr__grid-result'):
+            title_elem = item.select_one('h3, span.OSrXXb')
+            link_elem = item.select_one('a.shntl, a.eIuuYe')
+            price_elem = item.select_one('span.a8Pemb, span.dD8iuc')
+            seller_elem = item.select_one('div.aULzUe, span.aULzUe')
+            
+            if not title_elem or not link_elem:
                 continue
-        
-        # Fallback
-        if not results:
-            all_links = soup.find_all('a', href=re.compile(r'/shopping/product/'))
-            for link_elem in all_links[:20]:
-                try:
-                    title = link_elem.get_text(strip=True)
-                    link = link_elem.get('href', '')
-                    if link and not link.startswith('http'):
-                        link = 'https://www.google.com' + link
-                    
-                    if title and len(title) > 5:
-                        results.append({
-                            'title': title,
-                            'price_text': '',
-                            'seller': '',
-                            'link': link
-                        })
-                except:
-                    continue
+            
+            title = title_elem.get_text(strip=True)
+            link = link_elem.get('href')
+            if link and link.startswith('/url?'):
+                # Quitar prefijo /url?q=...
+                m = re.search(r'/url\?q=([^&]+)', link)
+                if m:
+                    link = m.group(1)
+            
+            price_text = price_elem.get_text(strip=True) if price_elem else ''
+            seller = seller_elem.get_text(strip=True) if seller_elem else ''
+            
+            # Intentar extraer número de precio
+            price_value = None
+            if price_text:
+                m_price = re.search(r'([\d.,]+)', price_text)
+                if m_price:
+                    try:
+                        raw = m_price.group(1).replace('.', '').replace(',', '.')
+                        price_value = float(raw)
+                    except:
+                        price_value = None
+            
+            results.append({
+                'title': title,
+                'link': link,
+                'price_text': price_text,
+                'price': price_value,
+                'currency': 'MXN',
+                'seller': seller
+            })
         
         return results
     except Exception as e:
         print(f"Error scraping Google Shopping: {e}")
         return []
 
-def _analyze_shopping_with_gemini(query: str, shopping_results: list) -> dict:
-    """Usa Gemini para analizar resultados de shopping"""
+def _analyze_with_gemini(query: str, upc: str, shopping_results: list) -> dict:
+    """Envía resultados de Google Shopping a Gemini para estructurarlos"""
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        if not GEMINI_API_KEY:
+            raise ValueError("Gemini API key no configurada")
         
-        context = f"""Analiza los siguientes resultados de Google Shopping para: "{query}"
+        model = genai.GenerativeModel(
+            'gemini-1.5-flash',
+            generation_config={
+                "temperature": 0.25,
+                "top_p": 0.8,
+                "top_k": 40,
+                "max_output_tokens": 1024,
+            }
+        )
+        
+        context = f"""Eres un asistente experto en análisis de resultados de Google Shopping.
+
+Recibirás:
+1. Un término de búsqueda (query)
+2. Un posible código UPC
+3. Una lista de resultados de Google Shopping (título, link, precio detectado, vendedor)
+
+Tu tarea es:
+- Identificar cuáles resultados corresponden claramente a PRODUCTOS específicos relacionados con la búsqueda
+- Normalizar el precio en formato numérico (cuando sea posible)
+- Identificar el vendedor / tienda (seller)
+- Devolver SIEMPRE un JSON con una lista "offers" y un campo "total_offers"
+
+FORMATO DE RESPUESTA (JSON válido, sin texto adicional):
+{{
+  "offers": [
+    {{
+      "title": "Nombre del producto",
+      "price": 1234.56,
+      "currency": "MXN",
+      "seller": "Nombre de la tienda o marketplace",
+      "link": "https://...",
+      "origin": "google_shopping",
+      "price_text": "texto original de precio si aplica"
+    }}
+  ],
+  "total_offers": 1,
+  "query_type": "shopping",
+  "price_range": {{
+    "min": 123.45,
+    "max": 234.56
+  }}
+}}
+
+INSTRUCCIONES:
+- Si el resultado parece claramente un producto que coincide con la búsqueda y/o UPC, inclúyelo.
+- Si no ves un precio claro, deja "price": null pero NO inventes el valor.
+- Usa "currency": "MXN" para México, a menos que el precio claramente sea en otra moneda.
+
+REGLAS PARA PRECIOS:
+- Precio MÍNIMO: ${PRICE_MIN} MXN
+- Precio MÁXIMO: ${PRICE_MAX} MXN
+- Si ves precios muy bajos como "$2.00" o "$7.00", NO los descartes; si dudas, deja "price": null
+- Si ves descuentos extremos (ej. 95%+), puedes dejar "price": null si no estás seguro
+- Es preferible incluir más ofertas aunque algunas tengan "price": null
+- Si el precio no es claro, déjalo como null
+
+Ejemplo de respuesta válida:
+{{
+  "offers": [
+    {{
+      "title": "Shampoo XYZ 750ml",
+      "price": 89.90,
+      "currency": "MXN",
+      "seller": "Walmart",
+      "link": "https://www.walmart.com.mx/...",
+      "origin": "google_shopping",
+      "price_text": "$89.90"
+    }}
+  ],
+  "total_offers": 1,
+  "query_type": "shopping",
+  "price_range": {{
+    "min": 89.9,
+    "max": 89.9
+  }}
+}}
 
 Productos encontrados:
 """
-        for idx, result in enumerate(shopping_results[:20], 1):
+        for idx, result in enumerate(shopping_results[:30], 1):
             context += f"\n{idx}. Producto: {result['title']}\n"
             if result.get('price_text'):
                 context += f"   Precio mencionado: {result['price_text']}\n"
+            if result.get('price') is not None:
+                context += f"   Precio numérico detectado: {result['price']}\n"
             if result.get('seller'):
                 context += f"   Vendedor: {result['seller']}\n"
             context += f"   Link: {result['link']}\n"
         
         prompt = f"""{context}
 
-Tu tarea es extraer y estructurar las ofertas de productos de estos resultados de shopping.
+Ahora, analiza estos resultados de Google Shopping para la búsqueda:
+- Query: "{query}"
+- UPC (si se proporcionó): "{upc or 'N/A'}"
 
-Para cada producto:
-1. **Extrae el nombre limpio** del producto
-2. **Extrae el precio numérico** del texto (IMPORTANTE: debe estar entre ${PRICE_MIN} y ${PRICE_MAX} MXN)
-3. **Identifica la moneda** (MXN, USD, EUR, etc.)
-4. **Identifica el vendedor/tienda** del sitio web
-5. **Incluye el link**
-
-REGLAS PARA PRECIOS:
-- Precio MÍNIMO: ${PRICE_MIN} MXN
-- Precio MÁXIMO: ${PRICE_MAX} MXN
-- Si ves "$2.00" o "$7.00", probablemente es PRECIO POR UNIDAD - ignóralo
-- Si ves descuentos del 98%, probablemente es un error - ignóralo
-- SOLO incluye precios que parezcan razonables para el producto
-- Si el precio no es claro, déjalo como null
-
-FORMATO (JSON válido sin markdown):
-{{
-  "query": "{query}",
-  "offers": [
-    {{
-      "title": "Nombre limpio del producto",
-      "price": 125.50,
-      "currency": "MXN",
-      "seller": "Nombre de la tienda",
-      "link": "URL completa"
-    }}
-  ],
-  "total_offers": 10,
-  "price_range": {{
-    "min": 100.00,
-    "max": 200.00,
-    "avg": 150.00,
-    "currency": "MXN"
-  }},
-  "summary": "Resumen de las ofertas encontradas"
-}}
-
-IMPORTANTE:
-- Responde SOLO con JSON válido, sin markdown ni texto adicional
-- Incluye TODOS los productos con información relevante
-- Si hay múltiples ofertas del mismo producto, inclúyelas todas
-- Calcula el price_range solo con precios válidos"""
-
+Devuelve ÚNICAMENTE el JSON especificado, sin explicación adicional, sin comentarios y sin markdown.
+"""
+        
         response = model.generate_content(prompt)
         result_text = response.text.strip()
         
-        # Limpiar markdown
-        result_text = result_text.replace('```json', '').replace('```', '').strip()
+        # Limpiar si viene con ```json
+        if result_text.startswith("```"):
+            result_text = re.sub(r"^```json", "", result_text, flags=re.IGNORECASE).strip()
+            result_text = re.sub(r"^```", "", result_text).strip()
+            result_text = re.sub(r"```$", "", result_text).strip()
         
         parsed = json.loads(result_text)
         
-        # Validación MÍNIMA
+        # Validación MÍNIMA pero permisiva con el precio
         validated_offers = []
         for offer in parsed.get('offers', []):
-            # Solo validar campos mínimos
+            # Solo validar campos mínimos obligatorios
             if not offer.get('title') or not offer.get('link'):
                 continue
-            
-            # Validar precio solo si existe
+
             price = offer.get('price')
             if price is not None and not _validate_price(price):
-                continue
-            
+                # Conservamos la oferta pero anulamos el precio dudoso
+                offer['price'] = None
+
             validated_offers.append(offer)
-        
+
         parsed['offers'] = validated_offers
         parsed['total_offers'] = len(validated_offers)
         
@@ -204,28 +237,30 @@ IMPORTANTE:
             if valid_prices:
                 parsed['price_range'] = {
                     'min': min(valid_prices),
-                    'max': max(valid_prices),
-                    'avg': sum(valid_prices) / len(valid_prices),
-                    'currency': 'MXN'
+                    'max': max(valid_prices)
                 }
         
         return parsed
-        
+    
     except Exception as e:
-        print(f"Error con Gemini en shopping: {e}")
+        print(f"Error con Gemini Shopping: {e}")
+        # Fallback - devolver lo scrapeado en formato estándar
+        fallback_offers = []
+        for r in shopping_results[:40]:
+            fallback_offers.append({
+                'title': r['title'],
+                'price': r.get('price'),
+                'currency': r.get('currency', 'MXN'),
+                'seller': r.get('seller', ''),
+                'link': r.get('link'),
+                'origin': 'shopping_fallback',
+                'price_text': r.get('price_text', '')
+            })
+        
         return {
-            'query': query,
-            'offers': [
-                {
-                    'title': r['title'],
-                    'price': None,
-                    'currency': 'MXN',
-                    'seller': r.get('seller', ''),
-                    'link': r['link']
-                }
-                for r in shopping_results[:20]
-            ],
-            'total_offers': len(shopping_results),
+            'offers': fallback_offers,
+            'total_offers': len(fallback_offers),
+            'query_type': 'shopping',
             'summary': f'Se encontraron {len(shopping_results)} productos para "{query}"'
         }
 
@@ -237,50 +272,39 @@ class handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
-
+    
     def do_POST(self):
         try:
-            if not GEMINI_API_KEY:
-                return self._send_error(500, 'API Key de Gemini no configurada')
+            content_len = int(self.headers.get('Content-Length', 0))
+            if content_len <= 0:
+                self._send_error(400, 'Body vacío')
+                return
             
-            body_len = int(self.headers.get('Content-Length', 0))
-            payload = json.loads(self.rfile.read(body_len).decode('utf-8'))
+            body = self.rfile.read(content_len)
+            data = json.loads(body.decode('utf-8'))
             
-            query = (payload.get('query') or '').strip()
-            hl = payload.get('hl', 'es')
-            gl = payload.get('gl', 'mx')
+            query = data.get('query', '')
+            upc = re.sub(r'\D+', '', data.get('upc', '') or '')
             
-            if not query:
-                return self._send_error(400, 'query es requerido')
-
-            # 1. Scrapear Google Shopping
-            shopping_results = _scrape_google_shopping(query, hl, gl)
+            if not query and not upc:
+                self._send_error(400, 'Se requiere query o upc')
+                return
             
-            if not shopping_results:
-                return self._send_error(404, 'No se encontraron productos en Google Shopping')
-
-            # 2. Analizar con Gemini
-            analyzed_data = _analyze_shopping_with_gemini(query, shopping_results)
+            final_query = query
+            if upc and upc not in query:
+                final_query = f"{query} {upc}" if query else upc
             
-            # 3. Agregar metadata
-            analyzed_data['search_engine'] = 'google_shopping_scraping'
-            analyzed_data['powered_by'] = 'gemini-2.0-flash'
-            analyzed_data['raw_count'] = len(shopping_results)
-            analyzed_data['validation'] = {
-                'total_scraped': len(shopping_results),
-                'total_validated': len(analyzed_data.get('offers', [])),
-                'price_range_filter': f'{PRICE_MIN}-{PRICE_MAX} MXN'
-            }
-
-            return self._send_success(analyzed_data)
-
+            shopping_results = _scrape_google_shopping(final_query)
+            analysis = _analyze_with_gemini(final_query, upc, shopping_results)
+            
+            self._send_success(analysis)
+        
         except json.JSONDecodeError:
-            return self._send_error(400, 'JSON inválido')
-        except requests.RequestException as e:
-            return self._send_error(500, f'Error de scraping: {str(e)}')
+            self._send_error(400, 'JSON inválido')
         except Exception as e:
-            return self._send_error(500, f'Error: {str(e)}')
-
+            print(f"Error en handler shopping: {e}")
+            self._send_error(500, 'Error interno del servidor')
+    
     def _send_success(self, data):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')

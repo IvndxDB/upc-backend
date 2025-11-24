@@ -11,9 +11,9 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Límites de validación
-PRICE_MIN = 10
-PRICE_MAX = 100000
+# Límites de validación (más flexibles)
+PRICE_MIN = 1
+PRICE_MAX = 200000
 
 # NUEVO: Dominios mexicanos conocidos (más flexible)
 MEXICAN_DOMAINS = ['mx', 'com.mx']
@@ -56,8 +56,8 @@ def _validate_price(price) -> bool:
     except:
         return False
 
-def _scrape_google_search(query: str, num: int = 20, hl: str = 'es', gl: str = 'mx') -> list:
-    """Scrapea resultados de búsqueda de Google"""
+def _scrape_google_search(query: str, num: int = 10, hl: str = 'es', gl: str = 'mx') -> list:
+    """Scrapea resultados de Google Search"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -80,110 +80,134 @@ def _scrape_google_search(query: str, num: int = 20, hl: str = 'es', gl: str = '
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'lxml')
+        soup = BeautifulSoup(response.text, 'html.parser')
         results = []
         
-        # Buscar divs de resultados orgánicos
-        search_results = soup.find_all('div', class_='g')
-        
-        for result in search_results[:num]:
-            try:
-                # Título
-                title_elem = result.find('h3')
-                title = title_elem.get_text() if title_elem else ''
-                
-                # Link
-                link_elem = result.find('a')
-                link = link_elem.get('href', '') if link_elem else ''
-                
-                # Snippet
-                snippet_elem = result.find('div', class_=['VwiC3b', 'yXK7lf'])
-                snippet = snippet_elem.get_text() if snippet_elem else ''
-                
-                # NUEVO: Aceptar TODOS los resultados, dejar que Gemini filtre
-                if title and link:
-                    results.append({
-                        'title': title,
-                        'link': link,
-                        'snippet': snippet
-                    })
-            except Exception as e:
+        # Resultados orgánicos
+        for g in soup.select('div.g'):
+            title_elem = g.select_one('h3')
+            link_elem = g.select_one('a')
+            if not title_elem or not link_elem:
                 continue
+            
+            title = title_elem.get_text(strip=True)
+            link = link_elem.get('href')
+            
+            # Extraer snippet
+            snippet_elem = g.select_one('.VwiC3b, .IsZvec')
+            snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ''
+            
+            if not link or not title:
+                continue
+            
+            results.append({
+                'title': title,
+                'link': link,
+                'snippet': snippet
+            })
         
-        return results
+        return results[:num]
     except Exception as e:
         print(f"Error scraping Google: {e}")
         return []
 
-def _analyze_with_gemini(query: str, search_results: list) -> dict:
-    """Usa Gemini para analizar los resultados de búsqueda"""
+def _analyze_with_gemini(query: str, upc: str, search_results: list) -> dict:
+    """Envía resultados a Gemini para estructurar los productos relevantes"""
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        if not GEMINI_API_KEY:
+            raise ValueError("Gemini API key no configurada")
         
-        # Preparar contexto para Gemini
-        context = f"""Analiza los siguientes resultados de búsqueda para la query: "{query}"
-
-Resultados encontrados:
-"""
-        for idx, result in enumerate(search_results[:15], 1):
-            context += f"\n{idx}. Título: {result['title']}\n   Link: {result['link']}\n   Descripción: {result['snippet']}\n"
+        model = genai.GenerativeModel(
+            'gemini-1.5-flash',
+            generation_config={
+                "temperature": 0.3,
+                "top_p": 0.8,
+                "top_k": 40,
+                "max_output_tokens": 1024,
+            }
+        )
         
-        prompt = f"""{context}
+        # Construir contexto con más resultados
+        context = f"""Eres un asistente experto en análisis de resultados de búsqueda de productos.
 
-Tu tarea es extraer y estructurar información de productos de estos resultados.
+Recibirás:
+1. Un término de búsqueda (query)
+2. Un posible código UPC
+3. Una lista de resultados de Google (título, link, snippet)
 
-REGLAS PARA PRECIOS:
-- El precio debe estar entre ${PRICE_MIN} MXN y ${PRICE_MAX} MXN
-- Si ves precios muy bajos ($2, $5, $7), probablemente es precio POR UNIDAD - ignóralo
-- Si el precio no es claro, déjalo como null
-- Incluye productos de sitios conocidos de e-commerce
+Tu tarea es:
+- Identificar cuáles resultados corresponden claramente a PRODUCTOS específicos relacionados con la búsqueda
+- Extraer la mejor estimación de precio cuando sea posible (si no estás seguro, usa null)
+- Identificar el vendedor / tienda (seller)
+- Devolver SIEMPRE un JSON con una lista "products" y un campo "total_found"
 
-IMPORTANTE: 
-- Si un resultado es claramente un producto pero no tiene precio visible, inclúyelo con price: null
-- Prioriza resultados de tiendas mexicanas conocidas (Walmart, Amazon MX, Chedraui, La Comer, etc.)
-- Responde SOLO con JSON válido, sin markdown
-
+FORMATO DE RESPUESTA (JSON válido, sin texto adicional):
 {{
   "products": [
     {{
       "title": "Nombre del producto",
-      "price": 125.50,
+      "price": 1234.56,
       "currency": "MXN",
-      "seller": "Nombre de la tienda",
-      "link": "URL completa",
-      "snippet": "Descripción breve"
+      "seller": "Nombre de la tienda o marketplace",
+      "link": "https://...",
+      "snippet": "Texto corto del resultado o descripción"
     }}
   ],
-  "total_found": 10,
-  "query_type": "product_search",
-  "summary": "Resumen breve de lo encontrado"
+  "total_found": 1,
+  "query_type": "search"
 }}
 
-Responde SOLO con JSON, sin texto adicional."""
+REGLAS PARA PRECIOS:
+- El precio debe estar entre ${PRICE_MIN} MXN y ${PRICE_MAX} MXN
+- Si ves precios muy bajos ($2, $5, $7), NO los descartes automáticamente; si dudas, deja "price": null
+- Si el precio no es claro, déjalo como null
+- Es preferible incluir más productos aunque algunos tengan "price": null
 
+IMPORTANTE: 
+- Si un resultado es claramente un producto pero no tiene precio claro, inclúyelo con "price": null
+- NO inventes precios si no aparecen en el texto
+- No incluyas resultados que sean noticias, blogs, PDF o contenido que no sea claramente un producto
+"""
+        # Meter más resultados en el contexto
+        context += "\nResultados encontrados:\n"
+        for idx, result in enumerate(search_results[:25], 1):
+            context += f"\n{idx}. Título: {result['title']}\n   Link: {result['link']}\n   Descripción: {result['snippet']}\n"
+        
+        prompt = f"""{context}
+
+Ahora, analiza los resultados anteriores para la búsqueda:
+- Query: "{query}"
+- UPC (si se proporcionó): "{upc or 'N/A'}"
+
+Devuelve ÚNICAMENTE el JSON solicitado (sin explicaciones, sin comentarios, sin markdown).
+"""
+        
         response = model.generate_content(prompt)
         result_text = response.text.strip()
         
-        # Limpiar markdown
-        result_text = result_text.replace('```json', '').replace('```', '').strip()
+        # Intentar limpiar si viene envuelto en ```json ...
+        if result_text.startswith("```"):
+            result_text = re.sub(r"^```json", "", result_text, flags=re.IGNORECASE).strip()
+            result_text = re.sub(r"^```", "", result_text).strip()
+            result_text = re.sub(r"```$", "", result_text).strip()
         
+        # Intentar convertir a JSON directamente
         parsed = json.loads(result_text)
         
-        # NUEVO: Validación MÁS PERMISIVA (solo rechaza basura obvia)
+        # Validación MÁS PERMISIVA: casi nunca tiramos productos
         validated_products = []
         for product in parsed.get('products', []):
-            # Solo validar que tenga campos mínimos
+            # Campos mínimos obligatorios
             if not product.get('title') or not product.get('link'):
                 continue
-            
-            # Validar precio solo si existe (permitir null)
+
+            # Si el precio existe pero se sale de rango, lo anulamos pero conservamos el producto
             price = product.get('price')
             if price is not None and not _validate_price(price):
-                continue
-            
-            # ACEPTAR TODO LO DEMÁS (sin filtro de dominio aquí)
+                product['price'] = None
+
             validated_products.append(product)
-        
+
         parsed['products'] = validated_products
         parsed['total_found'] = len(validated_products)
         
@@ -191,87 +215,70 @@ Responde SOLO con JSON, sin texto adicional."""
         
     except Exception as e:
         print(f"Error con Gemini: {e}")
-        # Fallback - ACEPTAR TODOS
+        # Fallback - ACEPTAR casi todo lo scrapeado
+        fallback_products = [
+            {
+                'title': r['title'],
+                'price': None,
+                'currency': 'MXN',
+                'seller': r['link'].split('/')[2] if '/' in r['link'] else '',
+                'link': r['link'],
+                'snippet': r['snippet']
+            }
+            for r in search_results[:30]  # Más resultados
+        ]
         return {
-            'products': [
-                {
-                    'title': r['title'],
-                    'price': None,
-                    'currency': 'MXN',
-                    'seller': r['link'].split('/')[2] if '/' in r['link'] else '',
-                    'link': r['link'],
-                    'snippet': r['snippet']
-                }
-                for r in search_results[:15]  # Más resultados
-            ],
-            'total_found': len(search_results),
+            'products': fallback_products,
+            'total_found': len(fallback_products),
             'query_type': 'search',
-            'summary': f'Se encontraron {len(search_results)} resultados para "{query}"'
+            'summary': f'Se encontraron {len(search_results)} resultados para "{query}" (fallback sin Gemini)'
         }
 
 class handler(BaseHTTPRequestHandler):
-
+    
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
-
+    
     def do_POST(self):
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
+            content_len = int(self.headers.get('Content-Length', 0))
+            if content_len <= 0:
+                self._send_error(400, 'Body vacío')
+                return
+            
+            body = self.rfile.read(content_len)
             data = json.loads(body.decode('utf-8'))
-
-            query_raw = (data.get('query') or '').strip()
-            upc_raw = data.get('upc', '')
-            upc = _clean_upc(upc_raw)
-
-            num = int(data.get('num', 20))
-            hl = data.get('hl', 'es')
-            gl = data.get('gl', 'mx')
-
-            if not GEMINI_API_KEY:
-                return self._send_error(500, 'API Key de Gemini no configurada')
-
-            # Determinar query
-            if query_raw:
-                q = query_raw
-            else:
-                if not upc:
-                    return self._send_error(400, 'UPC es requerido (o usa "query")')
-                q = upc
-
-            # 1. Scrapear Google
-            search_results = _scrape_google_search(q, num, hl, gl)
             
-            if not search_results:
-                return self._send_error(404, 'No se encontraron resultados')
-
-            # 2. Analizar con Gemini
-            analyzed_data = _analyze_with_gemini(q, search_results)
+            query = data.get('query', '')
+            upc = _clean_upc(data.get('upc', ''))
             
-            # 3. Agregar metadata
-            analyzed_data['raw_results'] = search_results[:5]
-            analyzed_data['search_engine'] = 'google_scraping'
-            analyzed_data['powered_by'] = 'gemini-2.0-flash'
-            analyzed_data['validation'] = {
-                'total_scraped': len(search_results),
-                'total_validated': len(analyzed_data.get('products', [])),
-                'price_range_filter': f'{PRICE_MIN}-{PRICE_MAX} MXN',
-                'domain_filter': 'MX + Known Retailers'
-            }
-
-            return self._send_success(analyzed_data)
-
+            if not query and not upc:
+                self._send_error(400, 'Se requiere query o upc')
+                return
+            
+            # Construir query final
+            final_query = query
+            if upc and upc not in query:
+                final_query = f"{query} {upc}" if query else upc
+            
+            # Scraping de Google
+            results = _scrape_google_search(final_query, num=20)
+            
+            # Enviar a Gemini
+            analysis = _analyze_with_gemini(final_query, upc, results)
+            
+            self._send_success(analysis)
+            
         except json.JSONDecodeError:
-            return self._send_error(400, 'JSON invalido')
-        except requests.RequestException as e:
-            return self._send_error(500, f'Error de scraping: {str(e)}')
+            self._send_error(400, 'JSON inválido')
         except Exception as e:
-            return self._send_error(500, f'Error: {str(e)}')
-
+            print(f"Error en handler search: {e}")
+            self._send_error(500, 'Error interno del servidor')
+    
     def _send_success(self, data):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
