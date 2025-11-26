@@ -62,131 +62,101 @@ def _root_domain(host: str) -> str:
 
 def _scrape_google_search(query: str, num: int = 10, hl: str = "es", gl: str = "mx") -> list:
     """
-    Scrapea resultados orgánicos de Google Search.
-    Usa varios selectores para adaptarse a cambios de HTML.
-    No filtra por país ni dominio; solo descarta resultados sin título o link.
+    Versión robusta: No depende de clases CSS específicas (como div.g).
+    Busca patrones estructurales (H3 dentro de A, o A conteniendo H3).
     """
     try:
+        # Headers rotativos básicos para evitar bloqueos inmediatos
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": f"{hl},{hl[:2]};q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": f"{hl}-{gl},{hl};q=0.9",
         }
 
-        params = {
-            "q": query,
-            "num": min(num or 10, 20),
-            "hl": hl,
-            "gl": gl,
-        }
-
-        url = "https://www.google.com/search"
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        params = {"q": query, "num": num + 5, "hl": hl, "gl": gl} # Pedimos un poco más por si acaso
+        
+        # URL limpia sin parámetros extraños
+        resp = requests.get("https://www.google.com/search", headers=headers, params=params, timeout=12)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-
-        # --- 1) Contenedores típicos de resultados: div.g, div.MjjYud, etc. ---
-        containers = soup.select("div.g, div.MjjYud, div.yuRUbf, div.NJo7tc")
         seen_links = set()
 
-        def add_result(title_elem, link_elem, snippet_elem=None):
-            if not title_elem or not link_elem:
-                return
+        # ESTRATEGIA: Buscar cualquier H3 que sea título, y encontrar su link padre o vecino
+        all_h3 = soup.find_all("h3")
+        
+        for h3 in all_h3:
+            if len(results) >= num: break
+            
+            title = h3.get_text(strip=True)
+            if not title: continue
 
-            title = title_elem.get_text(strip=True)
-            link = link_elem.get("href")
+            # Buscar el <a> contenedor o adyacente
+            link_elem = h3.find_parent("a")
+            if not link_elem:
+                # A veces el <a> está dentro del h3 o justo al lado
+                link_elem = h3.find("a")
+            
+            if not link_elem:
+                # Intento final: buscar en el padre del h3
+                parent = h3.parent
+                if parent:
+                    link_elem = parent.find("a", href=True)
 
-            if not title or not link:
-                return
-            if link in seen_links:
-                return
+            if not link_elem or not link_elem.get("href"):
+                continue
+
+            link = link_elem["href"]
+            
+            # Limpieza de links sucios de Google (/url?q=...)
+            if link.startswith("/url?"):
+                try:
+                    from urllib.parse import parse_qs, urlparse
+                    q = parse_qs(urlparse(link).query).get("q")
+                    if q: link = q[0]
+                except: pass
+
+            # Descartar enlaces internos de Google
+            if "google.com" in link or not link.startswith("http"):
+                continue
+
+            if link in seen_links: continue
             seen_links.add(link)
 
+            # Buscar snippet: Generalmente es un div o span después del título
+            # Buscamos el bloque de texto más cercano
             snippet = ""
-            if snippet_elem:
-                snippet = snippet_elem.get_text(" ", strip=True)
-            else:
-                # fallback: buscar snippet cercano
-                parent = title_elem.find_parent("div")
-                if parent:
-                    sn = parent.find(class_=re.compile(r"VwiC3b|IsZvec"))
-                    if sn:
-                        snippet = sn.get_text(" ", strip=True)
+            container = link_elem.find_parent("div")
+            if container:
+                # El texto del contenedor menos el título suele ser el snippet/metadata
+                full_text = container.get_text(" ", strip=True)
+                snippet = full_text.replace(title, "").strip()
 
-            # Dominio como "seller" aproximado
+            # Extraer precio del snippet
+            price = _extract_price_from_text(snippet)
+            
+            # Extraer vendedor (Seller) del dominio
             seller = ""
             try:
                 from urllib.parse import urlparse
-                host = urlparse(link).hostname or ""
-                seller = _root_domain(host)
-            except Exception:
-                pass
+                domain = urlparse(link).netloc
+                seller = _root_domain(domain)
+            except: pass
 
-            price = _extract_price_from_text(snippet)
+            results.append({
+                "title": title,
+                "link": link,
+                "snippet": snippet,
+                "price": price,
+                "currency": "MXN",
+                "seller": seller,
+            })
 
-            results.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "snippet": snippet,
-                    "price": price,
-                    "currency": "MXN",
-                    "seller": seller,
-                }
-            )
-
-        # 1A) recorrer contenedores principales
-        for g in containers:
-            title_elem = g.select_one("h3")
-            # a directo o dentro de yuRUbf
-            link_elem = g.select_one("a[href]")
-            snippet_elem = g.select_one(".VwiC3b, .IsZvec")
-            add_result(title_elem, link_elem, snippet_elem)
-
-        # --- 2) Fallback: cualquier h3 con un <a> alrededor ---
-        if not results:
-            for h3 in soup.find_all("h3"):
-                # Buscar un <a> asociado
-                link_elem = None
-                # a) padre <a>
-                if h3.parent and h3.parent.name == "a" and h3.parent.get("href"):
-                    link_elem = h3.parent
-                # b) hermano cercano <a>
-                if not link_elem:
-                    parent = h3.find_parent("a")
-                    if parent and parent.get("href"):
-                        link_elem = parent
-                # c) buscar <a> en ancestros cercanos
-                if not link_elem and h3.parent:
-                    candidate = h3.parent.find("a", href=True)
-                    if candidate:
-                        link_elem = candidate
-
-                if link_elem:
-                    # snippet genérico por si acaso
-                    snippet_elem = None
-                    parent_div = h3.find_parent("div")
-                    if parent_div:
-                        snippet_elem = parent_div.find(
-                            class_=re.compile(r"VwiC3b|IsZvec")
-                        )
-                    add_result(h3, link_elem, snippet_elem)
-
-        # Limitamos por num
-        return results[: num or 10]
+        return results
 
     except Exception as e:
-        print(f"Error scraping Google Search: {e}")
+        print(f"Error scraping Google: {e}")
         return []
 
 def _summarize_with_gemini(query: str, upc: str, results: list):
