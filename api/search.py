@@ -60,11 +60,11 @@ def _root_domain(host: str) -> str:
         return ".".join(parts[-3:])
     return ".".join(parts[-2:])
 
-
 def _scrape_google_search(query: str, num: int = 10, hl: str = "es", gl: str = "mx") -> list:
     """
     Scrapea resultados orgánicos de Google Search.
-    No filtra por país ni dominio, solo descarta resultados sin título o link.
+    Usa varios selectores para adaptarse a cambios de HTML.
+    No filtra por país ni dominio; solo descarta resultados sin título o link.
     """
     try:
         headers = {
@@ -95,23 +95,35 @@ def _scrape_google_search(query: str, num: int = 10, hl: str = "es", gl: str = "
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
 
-        # Bloques orgánicos típicos de Google
-        for g in soup.select("div.g"):
-            title_elem = g.select_one("h3")
-            link_elem = g.select_one("a")
+        # --- 1) Contenedores típicos de resultados: div.g, div.MjjYud, etc. ---
+        containers = soup.select("div.g, div.MjjYud, div.yuRUbf, div.NJo7tc")
+        seen_links = set()
+
+        def add_result(title_elem, link_elem, snippet_elem=None):
             if not title_elem or not link_elem:
-                continue
+                return
 
             title = title_elem.get_text(strip=True)
             link = link_elem.get("href")
 
             if not title or not link:
-                continue
+                return
+            if link in seen_links:
+                return
+            seen_links.add(link)
 
-            snippet_elem = g.select_one(".VwiC3b, .IsZvec")
-            snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ""
+            snippet = ""
+            if snippet_elem:
+                snippet = snippet_elem.get_text(" ", strip=True)
+            else:
+                # fallback: buscar snippet cercano
+                parent = title_elem.find_parent("div")
+                if parent:
+                    sn = parent.find(class_=re.compile(r"VwiC3b|IsZvec"))
+                    if sn:
+                        snippet = sn.get_text(" ", strip=True)
 
-            # Dom seller aproximado por dominio
+            # Dominio como "seller" aproximado
             seller = ""
             try:
                 from urllib.parse import urlparse
@@ -133,12 +145,49 @@ def _scrape_google_search(query: str, num: int = 10, hl: str = "es", gl: str = "
                 }
             )
 
-        return results
+        # 1A) recorrer contenedores principales
+        for g in containers:
+            title_elem = g.select_one("h3")
+            # a directo o dentro de yuRUbf
+            link_elem = g.select_one("a[href]")
+            snippet_elem = g.select_one(".VwiC3b, .IsZvec")
+            add_result(title_elem, link_elem, snippet_elem)
+
+        # --- 2) Fallback: cualquier h3 con un <a> alrededor ---
+        if not results:
+            for h3 in soup.find_all("h3"):
+                # Buscar un <a> asociado
+                link_elem = None
+                # a) padre <a>
+                if h3.parent and h3.parent.name == "a" and h3.parent.get("href"):
+                    link_elem = h3.parent
+                # b) hermano cercano <a>
+                if not link_elem:
+                    parent = h3.find_parent("a")
+                    if parent and parent.get("href"):
+                        link_elem = parent
+                # c) buscar <a> en ancestros cercanos
+                if not link_elem and h3.parent:
+                    candidate = h3.parent.find("a", href=True)
+                    if candidate:
+                        link_elem = candidate
+
+                if link_elem:
+                    # snippet genérico por si acaso
+                    snippet_elem = None
+                    parent_div = h3.find_parent("div")
+                    if parent_div:
+                        snippet_elem = parent_div.find(
+                            class_=re.compile(r"VwiC3b|IsZvec")
+                        )
+                    add_result(h3, link_elem, snippet_elem)
+
+        # Limitamos por num
+        return results[: num or 10]
 
     except Exception as e:
         print(f"Error scraping Google Search: {e}")
         return []
-
 
 def _summarize_with_gemini(query: str, upc: str, results: list):
     """
