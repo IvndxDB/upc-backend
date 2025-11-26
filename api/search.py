@@ -5,6 +5,7 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+import time
 
 # ===================== Configuración =====================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -29,7 +30,7 @@ def _extract_price_from_text(text: str):
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m and m.group(1):
-            raw = m.group(1).strip().replace(".", "").replace(",", ".") # Normalizar a 1200.50
+            raw = m.group(1).strip().replace(".", "").replace(",", ".") 
             try:
                 value = float(raw)
                 if PRICE_MIN <= value <= PRICE_MAX:
@@ -37,37 +38,140 @@ def _extract_price_from_text(text: str):
             except: continue
     return None
 
-def _root_domain(host: str) -> str:
-    if not host: return ""
-    host = host.lower().replace("www.", "")
-    parts = host.split(".")
-    if len(parts) >= 3 and ".".join(parts[-2:]) == "com.mx":
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:])
+def _root_domain(link: str) -> str:
+    """Extrae el dominio limpio (ej: walmart, amazon)"""
+    if not link: return ""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(link).netloc.lower().replace("www.", "")
+        parts = host.split(".")
+        # Lógica para .com.mx o .mx
+        if len(parts) >= 3 and (parts[-2] == "com" or parts[-2] == "org") and parts[-1] == "mx":
+             return parts[-3]
+        if len(parts) >= 2:
+            return parts[-2]
+        return host
+    except:
+        return ""
 
-def _scrape_google_search_robust(query: str, num: int = 10, hl: str = "es", gl: str = "mx") -> list:
+# ===================== Scrapers =====================
+
+def _scrape_duckduckgo(query: str, num: int = 15) -> list:
     """
-    Versión 'Todo Terreno': No busca clases CSS (div.g). 
-    Busca etiquetas H3 (títulos) y sus enlaces cercanos.
+    PLAN B: Scraper de DuckDuckGo (versión HTML).
+    Es mucho más permisivo con servidores como Vercel.
+    Usa 'kl=mx-es' para forzar resultados de MÉXICO.
     """
     try:
+        print(f"Intento con DuckDuckGo para: {query}")
+        url = "https://html.duckduckgo.com/html/"
+        data = {
+            'q': query,
+            'kl': 'mx-es',  # Región México
+            'df': 'w'       # Filtro de fecha (opcional)
+        }
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": f"{hl}-{gl},{hl};q=0.9",
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://html.duckduckgo.com/'
         }
         
-        # Pedimos un poco más de resultados para filtrar basura
-        params = {"q": query, "num": num + 5, "hl": hl, "gl": gl}
+        # DDG usa POST para la versión HTML a veces
+        resp = requests.post(url, data=data, headers=headers, timeout=10)
         
-        resp = requests.get("https://www.google.com/search", headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
+        # Si falla el POST, intentar GET
+        if resp.status_code != 200:
+             resp = requests.get(url, params=data, headers=headers, timeout=10)
+
+        if resp.status_code != 200: return []
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        results = []
+        
+        # Selectores de DDG HTML
+        for result in soup.select('.result'):
+            if len(results) >= num: break
+            
+            a_tag = result.select_one('.result__a')
+            if not a_tag: continue
+            
+            title = a_tag.get_text(strip=True)
+            link = a_tag.get('href')
+            
+            # Limpiar redirecciones de DDG
+            if link and "uddg=" in link:
+                from urllib.parse import unquote
+                try:
+                    link = unquote(link.split("uddg=")[1].split("&")[0])
+                except: pass
+
+            if not link or not link.startswith('http'): continue
+            
+            # Snippet
+            snippet_tag = result.select_one('.result__snippet')
+            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            
+            # Precio y Vendedor
+            price = _extract_price_from_text(snippet)
+            seller = _root_domain(link)
+            
+            results.append({
+                "title": title,
+                "link": link,
+                "snippet": snippet,
+                "price": price,
+                "currency": "MXN",
+                "seller": seller,
+                "origin": "ddg_fallback"
+            })
+            
+        return results
+    except Exception as e:
+        print(f"Error DDG: {e}")
+        return []
+
+def _scrape_google_robust(query: str, num: int = 10) -> list:
+    """
+    PLAN A: Scraper de Google con esteroides.
+    Usa google.com.mx y cookies de consentimiento para intentar pasar.
+    """
+    try:
+        # Usamos google.com.mx directo
+        url = "https://www.google.com.mx/search"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-MX,es;q=0.9",
+            # Cookie mágica para evitar el popup de 'Antes de ir a Google'
+            "Cookie": "CONSENT=YES+Cb.20210720-07-p0.en+FX+410;" 
+        }
+        
+        params = {
+            "q": query,
+            "num": num + 5,
+            "hl": "es",
+            "gl": "mx",
+            "pws": "0" # Desactivar personalización
+        }
+        
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        
+        # Si nos bloquean (429) o redirigen al login, fallamos rápido para ir a DDG
+        if resp.status_code != 200 or "google.com/sorry" in resp.url:
+            print("Google bloqueó la petición o pidió captcha.")
+            return []
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Verificar si es una página de "Antes de continuar"
+        if "consent" in soup.get_text().lower() and len(soup.find_all("a")) < 10:
+             print("Detectada página de consentimiento Google.")
+             return []
+
         results = []
         seen_links = set()
-
-        # ESTRATEGIA: Buscar todos los H3 (títulos)
+        
+        # Búsqueda agnóstica de clases (busca H3 títulos)
         all_h3 = soup.find_all("h3")
         
         for h3 in all_h3:
@@ -76,44 +180,30 @@ def _scrape_google_search_robust(query: str, num: int = 10, hl: str = "es", gl: 
             title = h3.get_text(strip=True)
             if not title: continue
 
-            # Buscar el <a> padre, hijo o vecino
+            # Buscar link asociado
             link_elem = h3.find_parent("a") or h3.find("a")
             if not link_elem:
                 parent = h3.parent
                 if parent: link_elem = parent.find("a", href=True)
 
             if not link_elem or not link_elem.get("href"): continue
-
             link = link_elem["href"]
             
-            # Limpiar redirecciones de Google (/url?q=...)
-            if link.startswith("/url?"):
-                try:
-                    from urllib.parse import parse_qs, urlparse
-                    q = parse_qs(urlparse(link).query).get("q")
-                    if q: link = q[0]
-                except: pass
+            # Limpieza url?q=
+            if "/url?q=" in link:
+                link = link.split("/url?q=")[1].split("&")[0]
 
-            # Filtros de calidad
             if "google." in link or not link.startswith("http"): continue
             if link in seen_links: continue
-            
             seen_links.add(link)
 
-            # Buscar snippet (texto descriptivo cercano)
             snippet = ""
             container = link_elem.find_parent("div")
             if container:
                 snippet = container.get_text(" ", strip=True).replace(title, "").strip()
 
             price = _extract_price_from_text(snippet)
-            
-            # Obtener seller del dominio si no hay mejor info
-            try:
-                from urllib.parse import urlparse
-                domain = urlparse(link).netloc
-                seller = _root_domain(domain)
-            except: seller = ""
+            seller = _root_domain(link)
 
             results.append({
                 "title": title,
@@ -122,32 +212,37 @@ def _scrape_google_search_robust(query: str, num: int = 10, hl: str = "es", gl: 
                 "price": price,
                 "currency": "MXN",
                 "seller": seller,
+                "origin": "google"
             })
 
         return results
-
     except Exception as e:
-        print(f"Error scraping: {e}")
+        print(f"Error Google: {e}")
         return []
 
 def _summarize_with_gemini(query, results):
-    # (Mantener lógica ligera para no gastar tokens innecesarios)
     if not results: return None, None, "local"
     
     prices = [r['price'] for r in results if r.get('price')]
     price_range = None
     if prices:
-        price_range = {"min": min(prices), "max": max(prices), "currency": "MXN"}
+        price_range = {
+            "min": min(prices),
+            "max": max(prices),
+            "avg": sum(prices)/len(prices),
+            "currency": "MXN"
+        }
 
     if not GEMINI_API_KEY:
         return f"Se encontraron {len(results)} resultados.", price_range, "regex"
 
     try:
         model = genai.GenerativeModel("gemini-1.5-flash")
-        context = f"Resumen breve (2 lineas) de estos productos para '{query}':\n"
-        for r in results[:5]:
-            context += f"- {r['title']} (${r['price']})\n"
-        
+        # Contexto simple para no gastar tokens
+        context = f"""Resumen en 1 oración (Español) para '{query}'.
+        Resultados: {len(results)}. 
+        Tiendas: {', '.join(list(set([r['seller'] for r in results[:5]])))}
+        """
         resp = model.generate_content(context)
         return resp.text.strip(), price_range, "gemini-2.0-flash"
     except:
@@ -163,14 +258,24 @@ class handler(BaseHTTPRequestHandler):
             query = data.get("query", "").strip()
             upc = _clean_upc(data.get("upc", ""))
             
-            # Construir query inteligente
             final_query = query
             if upc and upc not in query:
                 final_query = f"{query} {upc}".strip() if query else upc
 
-            # USAR LA NUEVA FUNCIÓN ROBUSTA
-            results = _scrape_google_search_robust(final_query, num=15)
+            # 1. INTENTO GOOGLE (Plan A)
+            results = _scrape_google_robust(final_query, num=12)
             
+            # 2. INTENTO DUCKDUCKGO (Plan B - Si Google falla)
+            # Si Google devuelve 0 o muy pocos resultados, vamos con DDG
+            if len(results) < 2:
+                print("Switching to DuckDuckGo fallback...")
+                ddg_results = _scrape_duckduckgo(final_query, num=15)
+                # Combinar evitando duplicados de link
+                seen = set(r['link'] for r in results)
+                for dr in ddg_results:
+                    if dr['link'] not in seen:
+                        results.append(dr)
+
             summary, prange, powered = _summarize_with_gemini(final_query, results)
 
             payload = {
