@@ -10,85 +10,60 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ===================== LISTA BLANCA (Tu filtro de calidad) =====================
-TRUSTED_SITES = [
-    "amazon.com.mx", "mercadolibre.com.mx", "walmart.com.mx", 
-    "bodegaaurrera.com.mx", "super.walmart.com.mx", "chedraui.com.mx", 
-    "soriana.com", "lacomer.com.mx", "liverpool.com.mx", 
-    "fahorro.com", "farmaciasguadalajara.com", "farmaciasanpablo.com.mx", 
-    "benavides.com.mx", "sanborns.com.mx", "sears.com.mx", 
-    "coppel.com", "elektra.mx", "hebmexico.com", "costco.com.mx", 
-    "sams.com.mx", "homedepot.com.mx"
-]
-
 # ===================== Helpers =====================
 def _clean_upc(s):
     return re.sub(r"\D+", "", s or "")
 
-def _build_targeted_query(upc, product_name):
-    # Construye: "UPC nombre (site:amazon... OR site:walmart...)"
-    # Limitamos a los top 10 para no romper el límite de longitud de DDG
-    top_sites = " OR ".join([f"site:{site}" for site in TRUSTED_SITES[:12]])
-    base = f"{product_name} {upc}" if product_name else upc
-    return f"{base} ({top_sites})"
-
 def _smart_search_with_gemini(query: str, upc: str) -> dict:
-    targeted_query = _build_targeted_query(upc, query)
-    print(f"🔎 Query: {targeted_query}")
+    # ESTRATEGIA: Búsqueda abierta pero localizada en México.
+    # No usamos "site:..." porque DDG bloquea queries muy largas.
+    search_query = f"{query} {upc} precio"
+    print(f"🔎 Query Abierta: {search_query}")
     
     raw_results = []
     
-    # 1. BÚSQUEDA EN DUCKDUCKGO (Robusta contra bloqueos)
     try:
         with DDGS() as ddgs:
-            # region='mx-es' fuerza resultados de México
-            ddg_gen = ddgs.text(targeted_query, region='mx-es', safesearch='off', max_results=15)
+            # Pedimos 20 resultados para tener suficiente "materia prima"
+            ddg_gen = ddgs.text(search_query, region='mx-es', safesearch='off', max_results=20)
             for r in ddg_gen:
-                link = r.get('href', '').lower()
-                # Doble verificación: que el link sea de confianza
-                if any(site in link for site in TRUSTED_SITES):
-                    raw_results.append(f"- Titulo: {r.get('title')}\n  URL: {r.get('href')}\n  Snippet: {r.get('body')}")
+                raw_results.append(f"- Título: {r.get('title')}\n  URL: {r.get('href')}\n  Texto: {r.get('body')}")
     except Exception as e:
         print(f"Error DDG: {e}")
-        return {"results": [], "summary": "Error de conexión externo", "price_range": None}
 
     if not raw_results:
-        return {"results": [], "summary": "No se encontraron ofertas en tiendas oficiales.", "price_range": None}
+        return {"results": [], "summary": "No se encontraron resultados externos.", "price_range": None}
 
-    # 2. GEMINI FILTRA Y EXTRAE PRECIOS
+    # ===================== FILTRO CON GEMINI =====================
     if not GEMINI_API_KEY:
         return {"results": [], "summary": "Falta API Key", "price_range": None}
 
     try:
-        model = genai.GenerativeModel(
-            "gemini-1.5-flash",
-            generation_config={"response_mime_type": "application/json"}
-        )
+        model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"response_mime_type": "application/json"})
 
         prompt = f"""
-        Eres un extractor de precios experto. Analiza estos resultados de búsqueda para UPC: {upc}.
+        Analiza estos resultados de búsqueda para el producto UPC: {upc}.
         
-        INPUT:
+        INPUT (Resultados Crudos):
         {chr(10).join(raw_results)}
 
-        INSTRUCCIONES:
-        1. Extrae solo ofertas de productos disponibles.
-        2. Busca el PRECIO en el snippet (ej: $120, 120 MXN). Si no está claro, pon null.
-        3. Estandariza el nombre de la tienda (seller) basado en la URL.
+        TU TAREA (FILTRO ESTRICTO):
+        1. Identifica ofertas de TIENDAS REALES (Amazon, MercadoLibre, Walmart, Farmacias, Liverpool, Chedraui, Soriana, etc).
+        2. DESCARTA TOTALMENTE sitios de cupones (radarcupon, promodescuentos), guías de rastreo, o PDFs.
+        3. Extrae el precio actual en MXN. Si no hay precio claro, pon null.
         
         OUTPUT JSON:
         {{
             "offers": [
                 {{
-                    "title": "Nombre producto",
-                    "price": 100.00,
+                    "title": "Nombre del producto",
+                    "price": 150.00,
                     "currency": "MXN",
-                    "seller": "Amazon",
+                    "seller": "Nombre Tienda",
                     "link": "https://..."
                 }}
             ],
-            "summary": "Resumen de 1 linea",
-            "price_range": {{ "min": 0, "max": 0 }}
+            "summary": "Resumen breve de disponibilidad"
         }}
         """
 
@@ -98,14 +73,14 @@ def _smart_search_with_gemini(query: str, upc: str) -> dict:
         return {
             "results": data.get("offers", []),
             "summary": data.get("summary", ""),
-            "price_range": data.get("price_range", None)
+            "price_range": None
         }
 
     except Exception as e:
         print(f"Error Gemini: {e}")
         return {"results": [], "summary": "Error procesando datos", "price_range": None}
 
-# ===================== Handler Vercel =====================
+# ===================== Handler =====================
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
@@ -115,14 +90,12 @@ class handler(BaseHTTPRequestHandler):
             query = data.get("query", "").strip()
             upc = _clean_upc(data.get("upc", ""))
             
-            # Ejecutar lógica inteligente
             smart_data = _smart_search_with_gemini(query, upc)
             
             payload = {
                 "organic_results": smart_data["results"],
                 "gemini_summary": smart_data["summary"],
-                "gemini_price_range": smart_data["price_range"],
-                "powered_by": "gemini-whitelist"
+                "powered_by": "gemini-open-search"
             }
 
             self.send_response(200)
