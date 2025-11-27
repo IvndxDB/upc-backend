@@ -10,29 +10,15 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ===================== LISTA BLANCA DE TIENDAS =====================
-# Solo buscaremos resultados dentro de estos dominios confiables
+# ===================== LISTA BLANCA (Tu filtro de calidad) =====================
 TRUSTED_SITES = [
-    "amazon.com.mx",
-    "mercadolibre.com.mx",
-    "walmart.com.mx",
-    "bodegaaurrera.com.mx",
-    "super.walmart.com.mx",
-    "chedraui.com.mx",
-    "soriana.com",
-    "lacomer.com.mx",
-    "liverpool.com.mx",
-    "fahorro.com",           # Farmacias del Ahorro
-    "farmaciasguadalajara.com",
-    "farmaciasanpablo.com.mx",
-    "benavides.com.mx",
-    "sanborns.com.mx",
-    "sears.com.mx",
-    "coppel.com",
-    "elektra.mx",
-    "hebmexico.com",
-    "costco.com.mx",
-    "sams.com.mx"
+    "amazon.com.mx", "mercadolibre.com.mx", "walmart.com.mx", 
+    "bodegaaurrera.com.mx", "super.walmart.com.mx", "chedraui.com.mx", 
+    "soriana.com", "lacomer.com.mx", "liverpool.com.mx", 
+    "fahorro.com", "farmaciasguadalajara.com", "farmaciasanpablo.com.mx", 
+    "benavides.com.mx", "sanborns.com.mx", "sears.com.mx", 
+    "coppel.com", "elektra.mx", "hebmexico.com", "costco.com.mx", 
+    "sams.com.mx", "homedepot.com.mx"
 ]
 
 # ===================== Helpers =====================
@@ -40,65 +26,36 @@ def _clean_upc(s):
     return re.sub(r"\D+", "", s or "")
 
 def _build_targeted_query(upc, product_name):
-    """
-    Construye una query que fuerza al buscador a mirar SOLO en sitios confiables.
-    Ejemplo: '750100... (site:amazon.com.mx OR site:walmart.com.mx ...)'
-    """
-    # Dividimos los sitios en grupos para no saturar la query (DDG tiene limite de caracteres)
-    # Priorizamos los top 5 para la búsqueda principal
-    top_sites = " OR ".join([f"site:{site}" for site in TRUSTED_SITES[:8]])
-    
-    # Si tenemos nombre del producto, ayuda mucho
+    # Construye: "UPC nombre (site:amazon... OR site:walmart...)"
+    # Limitamos a los top 10 para no romper el límite de longitud de DDG
+    top_sites = " OR ".join([f"site:{site}" for site in TRUSTED_SITES[:12]])
     base = f"{product_name} {upc}" if product_name else upc
-    
     return f"{base} ({top_sites})"
 
-def _smart_search_with_gemini_filter(query: str, upc: str) -> dict:
-    """
-    1. Busca en DDG restringido a sitios mexicanos confiables.
-    2. Usa Gemini para limpiar y estructurar el precio.
-    """
-    
-    # Construimos la búsqueda "quirúrgica"
+def _smart_search_with_gemini(query: str, upc: str) -> dict:
     targeted_query = _build_targeted_query(upc, query)
-    print(f"🔎 Query restringida: {targeted_query}")
+    print(f"🔎 Query: {targeted_query}")
     
     raw_results = []
     
+    # 1. BÚSQUEDA EN DUCKDUCKGO (Robusta contra bloqueos)
     try:
         with DDGS() as ddgs:
-            # Buscamos en región MX
-            ddg_gen = ddgs.text(
-                targeted_query, 
-                region='mx-es', 
-                safesearch='off',
-                max_results=15  # 15 resultados de calidad valen más que 50 de basura
-            )
-            
+            # region='mx-es' fuerza resultados de México
+            ddg_gen = ddgs.text(targeted_query, region='mx-es', safesearch='off', max_results=15)
             for r in ddg_gen:
-                # Pre-validación rápida: ¿El link contiene alguno de nuestros sitios confiables?
                 link = r.get('href', '').lower()
+                # Doble verificación: que el link sea de confianza
                 if any(site in link for site in TRUSTED_SITES):
-                    raw_results.append(f"- Titulo: {r.get('title')}\n  URL: {link}\n  Texto: {r.get('body')}")
-                    
+                    raw_results.append(f"- Titulo: {r.get('title')}\n  URL: {r.get('href')}\n  Snippet: {r.get('body')}")
     except Exception as e:
         print(f"Error DDG: {e}")
-        return {"results": [], "summary": "Error externo", "price_range": None}
+        return {"results": [], "summary": "Error de conexión externo", "price_range": None}
 
     if not raw_results:
-        # Fallback: Si la búsqueda restringida falla, intentamos una búsqueda abierta simple
-        try:
-             with DDGS() as ddgs:
-                fallback_query = f"{query} {upc} precio"
-                print(f"⚠️ Fallback a búsqueda abierta: {fallback_query}")
-                for r in ddgs.text(fallback_query, region='mx-es', max_results=5):
-                    raw_results.append(f"- Titulo: {r.get('title')}\n  URL: {r.get('href')}\n  Texto: {r.get('body')}")
-        except: pass
+        return {"results": [], "summary": "No se encontraron ofertas en tiendas oficiales.", "price_range": None}
 
-    if not raw_results:
-         return {"results": [], "summary": "No se encontraron productos.", "price_range": None}
-
-    # --- GEMINI: EL EXTRACTOR ---
+    # 2. GEMINI FILTRA Y EXTRAE PRECIOS
     if not GEMINI_API_KEY:
         return {"results": [], "summary": "Falta API Key", "price_range": None}
 
@@ -109,32 +66,29 @@ def _smart_search_with_gemini_filter(query: str, upc: str) -> dict:
         )
 
         prompt = f"""
-        Analiza estos resultados de búsqueda para el producto UPC: {upc} ({query}).
+        Eres un extractor de precios experto. Analiza estos resultados de búsqueda para UPC: {upc}.
         
-        OBJETIVO: Extraer ofertas válidas de tiendas mexicanas.
-        
-        INPUT DATOS CRUDOS:
+        INPUT:
         {chr(10).join(raw_results)}
 
         INSTRUCCIONES:
-        1. Ignora resultados que no parezcan páginas de producto (blogs, pdfs).
-        2. Intenta identificar el PRECIO ACTUAL en MXN (busca signos $ o 'precio').
-        3. Si no encuentras precio en el texto, pon null (el frontend lo buscará después).
-        4. Estandariza el nombre de la tienda (seller) basado en la URL.
-
+        1. Extrae solo ofertas de productos disponibles.
+        2. Busca el PRECIO en el snippet (ej: $120, 120 MXN). Si no está claro, pon null.
+        3. Estandariza el nombre de la tienda (seller) basado en la URL.
+        
         OUTPUT JSON:
         {{
             "offers": [
                 {{
-                    "title": "...",
-                    "price": 120.00,
+                    "title": "Nombre producto",
+                    "price": 100.00,
                     "currency": "MXN",
-                    "seller": "Walmart",
-                    "link": "..."
+                    "seller": "Amazon",
+                    "link": "https://..."
                 }}
             ],
-            "summary": "Resumen breve de disponibilidad",
-            "price_range": {{ "min": 100, "max": 200 }}
+            "summary": "Resumen de 1 linea",
+            "price_range": {{ "min": 0, "max": 0 }}
         }}
         """
 
@@ -149,10 +103,9 @@ def _smart_search_with_gemini_filter(query: str, upc: str) -> dict:
 
     except Exception as e:
         print(f"Error Gemini: {e}")
-        return {"results": [], "summary": "Error procesando", "price_range": None}
+        return {"results": [], "summary": "Error procesando datos", "price_range": None}
 
-
-# ===================== Handler =====================
+# ===================== Handler Vercel =====================
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
@@ -162,14 +115,14 @@ class handler(BaseHTTPRequestHandler):
             query = data.get("query", "").strip()
             upc = _clean_upc(data.get("upc", ""))
             
-            # Lógica inteligente
-            smart_data = _smart_search_with_gemini_filter(query, upc)
+            # Ejecutar lógica inteligente
+            smart_data = _smart_search_with_gemini(query, upc)
             
             payload = {
                 "organic_results": smart_data["results"],
                 "gemini_summary": smart_data["summary"],
                 "gemini_price_range": smart_data["price_range"],
-                "powered_by": "gemini-smart-filter"
+                "powered_by": "gemini-whitelist"
             }
 
             self.send_response(200)
