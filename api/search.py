@@ -2,11 +2,15 @@ from http.server import BaseHTTPRequestHandler
 import json
 import os
 import re
-from duckduckgo_search import DDGS
+import urllib.parse
+import requests
 import google.generativeai as genai
+import statistics
 
 # ===================== Configuración =====================
+SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -14,71 +18,123 @@ if GEMINI_API_KEY:
 def _clean_upc(s):
     return re.sub(r"\D+", "", s or "")
 
-def _smart_search_with_gemini(query: str, upc: str) -> dict:
-    # ESTRATEGIA: Búsqueda abierta pero localizada en México.
-    # No usamos "site:..." porque DDG bloquea queries muy largas.
-    search_query = f"{query} {upc} precio"
-    print(f"🔎 Query Abierta: {search_query}")
+def _fetch_serpapi(query):
+    """Trae resultados crudos de SerpApi (Shopping + Organic)"""
+    if not SERPAPI_KEY:
+        print("Falta SERPAPI_KEY")
+        return []
+
+    print(f"🌎 Consultando SerpApi: {query}")
+    params = {
+        'engine': 'google',
+        'q': query,
+        'api_key': SERPAPI_KEY,
+        'hl': 'es', 
+        'gl': 'mx', 
+        'google_domain': 'google.com.mx',
+        'num': '15',
+        'tbm': 'shop' # Priorizamos Shopping para precios
+    }
     
-    raw_results = []
-    
+    results = []
     try:
-        with DDGS() as ddgs:
-            # Pedimos 20 resultados para tener suficiente "materia prima"
-            ddg_gen = ddgs.text(search_query, region='mx-es', safesearch='off', max_results=20)
-            for r in ddg_gen:
-                raw_results.append(f"- Título: {r.get('title')}\n  URL: {r.get('href')}\n  Texto: {r.get('body')}")
+        # 1. Búsqueda Shopping (Mejor para precios)
+        resp = requests.get('https://serpapi.com/search.json', params=params, timeout=15)
+        data = resp.json()
+        
+        # Procesar Shopping Results
+        for r in data.get('shopping_results', []):
+            results.append({
+                'title': r.get('title'),
+                'link': r.get('link'),
+                'price_raw': r.get('extracted_price') or r.get('price'),
+                'seller': r.get('source'),
+                'source': 'shopping'
+            })
+            
+        # 2. Si hay pocos resultados, intentar búsqueda orgánica normal
+        if len(results) < 5:
+            params.pop('tbm') # Quitar modo shopping
+            resp_org = requests.get('https://serpapi.com/search.json', params=params, timeout=15)
+            data_org = resp_org.json()
+            
+            for r in data_org.get('organic_results', []):
+                # Intentar sacar precio del snippet
+                snippet = r.get('snippet', '')
+                price_match = re.search(r'\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', snippet)
+                price = float(price_match.group(1).replace(',', '')) if price_match else None
+                
+                results.append({
+                    'title': r.get('title'),
+                    'link': r.get('link'),
+                    'price_raw': price,
+                    'seller': urllib.parse.urlparse(r.get('link')).netloc.replace('www.',''),
+                    'source': 'organic'
+                })
+
     except Exception as e:
-        print(f"Error DDG: {e}")
+        print(f"Error SerpApi: {e}")
+        
+    return results
 
-    if not raw_results:
-        return {"results": [], "summary": "No se encontraron resultados externos.", "price_range": None}
+def _audit_with_gemini(raw_items, upc):
+    """
+    Gemini analiza los precios. Si detecta 'outliers' (precios ridículamente bajos/altos),
+    los marca como null para forzar una re-verificación en el frontend.
+    """
+    if not raw_items: return [], "Sin resultados", None
+    
+    # Pre-cálculo simple para ayudar a Gemini
+    valid_prices = []
+    for i in raw_items:
+        try:
+            p = float(str(i['price_raw']).replace('$','').replace(',',''))
+            if p > 0: valid_prices.append(p)
+        except: pass
+    
+    avg_price = statistics.median(valid_prices) if valid_prices else 0
 
-    # ===================== FILTRO CON GEMINI =====================
     if not GEMINI_API_KEY:
-        return {"results": [], "summary": "Falta API Key", "price_range": None}
+        # Sin Gemini, devolvemos tal cual
+        return raw_items, "Análisis local (Sin IA)", {"avg": avg_price}
 
     try:
         model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"response_mime_type": "application/json"})
-
+        
         prompt = f"""
-        Analiza estos resultados de búsqueda para el producto UPC: {upc}.
-        
-        INPUT (Resultados Crudos):
-        {chr(10).join(raw_results)}
+        Actúa como auditor de precios.
+        Producto buscado UPC: {upc}.
+        Precio Mediano estimado: ${avg_price}
 
-        TU TAREA (FILTRO ESTRICTO):
-        1. Identifica ofertas de TIENDAS REALES (Amazon, MercadoLibre, Walmart, Farmacias, Liverpool, Chedraui, Soriana, etc).
-        2. DESCARTA TOTALMENTE sitios de cupones (radarcupon, promodescuentos), guías de rastreo, o PDFs.
-        3. Extrae el precio actual en MXN. Si no hay precio claro, pon null.
-        
+        LISTA DE CANDIDATOS:
+        {json.dumps(raw_items[:20], ensure_ascii=False)}
+
+        INSTRUCCIONES:
+        1. Estandariza el 'seller' (ej: 'www.walmart.com.mx' -> 'Walmart').
+        2. ANALISIS DE PRECIO (CRITICO):
+           - Si un precio es MUY bajo comparado con la mediana (ej: $7 vs $100), es probable que sea un accesorio, costo de envío o error.
+           - Si detectas esto, pon "price": null y "flag": "suspicious_low".
+           - Si el precio parece correcto, mantenlo como número.
+        3. Elimina resultados duplicados o irrelevantes (PDFs, blogs).
+
         OUTPUT JSON:
         {{
-            "offers": [
-                {{
-                    "title": "Nombre del producto",
-                    "price": 150.00,
-                    "currency": "MXN",
-                    "seller": "Nombre Tienda",
-                    "link": "https://..."
-                }}
+            "verified_items": [
+                {{ "title": "...", "price": 120.00, "currency": "MXN", "seller": "Walmart", "link": "...", "flag": "ok" }},
+                {{ "title": "...", "price": null, "currency": "MXN", "seller": "Amazon", "link": "...", "flag": "suspicious_low" }}
             ],
-            "summary": "Resumen breve de disponibilidad"
+            "summary": "Resumen del análisis (ej: 'Se detectaron 2 precios erróneos que requieren verificación')."
         }}
         """
-
-        response = model.generate_content(prompt)
-        data = json.loads(response.text)
         
-        return {
-            "results": data.get("offers", []),
-            "summary": data.get("summary", ""),
-            "price_range": None
-        }
+        resp = model.generate_content(prompt)
+        data = json.loads(resp.text)
+        return data.get("verified_items", []), data.get("summary", ""), {"avg": avg_price}
 
     except Exception as e:
         print(f"Error Gemini: {e}")
-        return {"results": [], "summary": "Error procesando datos", "price_range": None}
+        # Fallback: devolver lo que teníamos
+        return raw_items, "Error en IA, mostrando datos crudos", None
 
 # ===================== Handler =====================
 class handler(BaseHTTPRequestHandler):
@@ -90,12 +146,23 @@ class handler(BaseHTTPRequestHandler):
             query = data.get("query", "").strip()
             upc = _clean_upc(data.get("upc", ""))
             
-            smart_data = _smart_search_with_gemini(query, upc)
+            # 1. Búsqueda Fuerte (SerpApi)
+            search_query = f"{query} {upc}".strip()
+            raw_results = _fetch_serpapi(search_query)
             
+            # 2. Auditoría Inteligente (Gemini)
+            # Aquí es donde Gemini decide si el precio es real o basura
+            verified_items, summary, meta = _audit_with_gemini(raw_results, upc)
+            
+            # Nota: Los items que Gemini marque con price: null serán procesados
+            # automáticamente por 'enrichOneSlow' en tu background.js, 
+            # haciendo esa "búsqueda específica" que pediste.
+
             payload = {
-                "organic_results": smart_data["results"],
-                "gemini_summary": smart_data["summary"],
-                "powered_by": "gemini-open-search"
+                "organic_results": verified_items,
+                "gemini_summary": summary,
+                "gemini_metadata": meta,
+                "powered_by": "serpapi-gemini-auditor"
             }
 
             self.send_response(200)
