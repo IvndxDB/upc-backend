@@ -17,9 +17,11 @@ def _clean_upc(s):
 
 def _fetch_serpapi_organic(query):
     """
-    Usa SerpApi en modo ORGANICO (no shopping) para traer más resultados.
+    Usa SerpApi en modo ORGANICO.
     """
-    if not SERPAPI_KEY: return []
+    if not SERPAPI_KEY:
+        print("⚠️ Falta SERPAPI_KEY")
+        return []
 
     print(f"🌎 SerpApi Orgánico: {query}")
     params = {
@@ -29,7 +31,7 @@ def _fetch_serpapi_organic(query):
         'hl': 'es', 
         'gl': 'mx', 
         'google_domain': 'google.com.mx',
-        'num': '20' # Pedimos 20 para tener variedad
+        'num': '15' 
     }
     
     results = []
@@ -53,50 +55,32 @@ def _fetch_serpapi_organic(query):
 
 def _analyze_with_gemini(raw_items, upc):
     """
-    Gemini actúa como EXTRACTOR: Lee el título y snippet para hallar el precio.
+    Intenta extraer precios con Gemini.
     """
-    if not raw_items: return [], "Sin resultados"
-    
-    if not GEMINI_API_KEY:
-        return raw_items, "Sin IA"
+    if not raw_items: return [], "Sin resultados brutos"
+    if not GEMINI_API_KEY: return raw_items, "Sin API Key de Gemini (Mostrando crudos)"
 
     try:
         model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"response_mime_type": "application/json"})
         
-        # Le damos los datos crudos a Gemini
         prompt = f"""
         Analiza estos resultados de búsqueda para UPC: {upc}.
         
-        INPUT DATOS:
-        {json.dumps(raw_items[:20], ensure_ascii=False)}
+        DATOS:
+        {json.dumps(raw_items[:15], ensure_ascii=False)}
 
         INSTRUCCIONES:
-        1. Identifica ofertas de TIENDAS (Amazon, Walmart, Chedraui, La Comer, Farmacias, etc).
-        2. EXTRAE EL PRECIO del 'snippet' o 'rich_snippet'. 
-           - Busca formatos como "$100", "MXN 100", "$100.00".
-           - Si no hay precio visible, pon "price": null (mi sistema lo buscará después).
-        3. Estandariza el nombre de la tienda ("seller").
-        4. Descarta PDFs, noticias o sitios de cupones basura.
+        1. Devuelve una lista "offers" con los productos encontrados.
+        2. Intenta extraer el precio. Si no hay, pon null.
+        3. Estandariza el "seller" (ej: amazon.com.mx -> Amazon).
+        4. NO filtres agresivamente. Si parece una tienda, inclúyelo.
 
         OUTPUT JSON:
         {{
             "offers": [
-                {{ 
-                    "title": "...", 
-                    "price": 120.00, 
-                    "currency": "MXN", 
-                    "seller": "Walmart", 
-                    "link": "..." 
-                }},
-                {{ 
-                    "title": "...", 
-                    "price": null, 
-                    "currency": "MXN", 
-                    "seller": "Chedraui", 
-                    "link": "..." 
-                }}
+                {{ "title": "...", "price": 100.00, "currency": "MXN", "seller": "...", "link": "..." }}
             ],
-            "summary": "Resumen breve"
+            "summary": "Resumen"
         }}
         """
         
@@ -105,8 +89,26 @@ def _analyze_with_gemini(raw_items, upc):
         return data.get("offers", []), data.get("summary", "")
 
     except Exception as e:
-        print(f"Error Gemini: {e}")
-        return [], "Error IA"
+        print(f"⚠️ Error Gemini: {e}")
+        # FALLBACK MANUAL: Si Gemini falla, devolvemos los datos crudos formateados
+        # para que el frontend no se quede vacío.
+        fallback = []
+        for r in raw_items:
+            fallback.append({
+                "title": r['title'],
+                "price": None, # El frontend lo buscará
+                "currency": "MXN",
+                "seller": _extract_seller_from_url(r['link']),
+                "link": r['link']
+            })
+        return fallback, "Error IA (Fallback Activado)"
+
+def _extract_seller_from_url(url):
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lower().replace('www.', '')
+        return domain.split('.')[0].capitalize()
+    except: return "Desconocido"
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -117,19 +119,28 @@ class handler(BaseHTTPRequestHandler):
             query = data.get("query", "").strip()
             upc = _clean_upc(data.get("upc", ""))
             
-            # Búsqueda amplia para encontrar Chedraui, La Comer, etc.
+            # Construir query robusta
             search_query = f"{query} {upc} precio".strip()
             
-            # 1. Traer datos crudos (muchos)
+            # 1. Obtener datos crudos
             raw_results = _fetch_serpapi_organic(search_query)
             
-            # 2. IA filtra y extrae precios
+            if not raw_results:
+                # Si SerpApi devolvió vacío, avisar
+                msg = "SerpApi no devolvió resultados (Revisar API Key)"
+                print(msg)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({"organic_results": [], "gemini_summary": msg}).encode("utf-8"))
+                return
+
+            # 2. Procesar con IA (o Fallback)
             verified_items, summary = _analyze_with_gemini(raw_results, upc)
             
             payload = {
                 "organic_results": verified_items,
                 "gemini_summary": summary,
-                "powered_by": "serpapi-organic-gemini"
+                "powered_by": "serpapi-organic"
             }
 
             self.send_response(200)
