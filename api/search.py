@@ -4,6 +4,7 @@ import os
 import re
 import requests
 import google.generativeai as genai
+from urllib.parse import urlparse
 
 # ===================== Configuración =====================
 SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
@@ -16,17 +17,37 @@ if GEMINI_API_KEY:
 def _clean_upc(s):
     return re.sub(r"\D+", "", s or "")
 
-def _extract_seller_from_url(url):
+def _extract_domain(url):
     try:
-        from urllib.parse import urlparse
-        domain = urlparse(url).netloc.lower().replace('www.', '')
-        return domain.split('.')[0].capitalize()
+        netloc = urlparse(url).netloc.lower().replace('www.', '')
+        # Extraer nombre principal (ej: walmart.com.mx -> walmart)
+        return netloc.split('.')[0].capitalize()
     except: return "Desconocido"
 
+def _deduplicate_by_domain(items):
+    """
+    Filtro matemático: Asegura que solo haya 1 item por tienda.
+    Si hay repetidos (ej: 3 links de Amazon), se queda con el primero (el más relevante).
+    """
+    seen_domains = set()
+    unique_items = []
+    
+    for item in items:
+        # Normalizar el vendedor o dominio
+        seller = item.get('seller') or _extract_domain(item.get('link', ''))
+        seller_key = seller.lower().strip()
+        
+        # Corrección manual para variantes (ej: "Super" vs "Walmart")
+        if 'walmart' in seller_key: seller_key = 'walmart'
+        if 'aurrera' in seller_key: seller_key = 'bodega aurrera'
+        
+        if seller_key not in seen_domains:
+            unique_items.append(item)
+            seen_domains.add(seller_key)
+            
+    return unique_items
+
 def _fetch_serpapi_organic(query):
-    """
-    Usa SerpApi en modo ORGANICO (trae todo, no solo shopping).
-    """
     if not SERPAPI_KEY:
         print("⚠️ Falta SERPAPI_KEY")
         return []
@@ -39,7 +60,7 @@ def _fetch_serpapi_organic(query):
         'hl': 'es', 
         'gl': 'mx', 
         'google_domain': 'google.com.mx',
-        'num': '15' 
+        'num': '20' 
     }
     
     results = []
@@ -47,7 +68,6 @@ def _fetch_serpapi_organic(query):
         resp = requests.get('https://serpapi.com/search.json', params=params, timeout=20)
         data = resp.json()
         
-        # Procesamos resultados orgánicos
         for r in data.get('organic_results', []):
             results.append({
                 'title': r.get('title'),
@@ -62,12 +82,9 @@ def _fetch_serpapi_organic(query):
     return results
 
 def _analyze_with_gemini(raw_items, upc):
-    """
-    Intenta extraer precios con Gemini. Si falla, devuelve crudos.
-    """
     if not raw_items: return [], "Sin resultados brutos"
     
-    # FALLBACK: Si no hay Gemini, devolvemos los datos para que el frontend los parsee
+    # 1. FALLBACK MANUAL (Si no hay IA)
     if not GEMINI_API_KEY: 
         fallback = []
         for r in raw_items:
@@ -75,11 +92,13 @@ def _analyze_with_gemini(raw_items, upc):
                 "title": r['title'],
                 "price": None, 
                 "currency": "MXN",
-                "seller": _extract_seller_from_url(r['link']),
+                "seller": _extract_domain(r['link']),
                 "link": r['link']
             })
-        return fallback, "Sin API Key de Gemini (Mostrando crudos)"
+        # Aplicar deduplicación manual
+        return _deduplicate_by_domain(fallback), "Sin API Key (Crudos Deduplicados)"
 
+    # 2. INTENTO CON IA
     try:
         model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"response_mime_type": "application/json"})
         
@@ -87,18 +106,19 @@ def _analyze_with_gemini(raw_items, upc):
         Analiza estos resultados de búsqueda para UPC: {upc}.
         
         DATOS:
-        {json.dumps(raw_items[:18], ensure_ascii=False)}
+        {json.dumps(raw_items[:20], ensure_ascii=False)}
 
         INSTRUCCIONES:
-        1. Devuelve una lista "offers" con los productos encontrados.
-        2. Intenta extraer el precio. Si no hay, pon null.
-        3. Estandariza el "seller" (ej: amazon.com.mx -> Amazon).
-        4. NO filtres agresivamente. Incluye Walmart, Aurrera, Chedraui, etc. aunque no tengan precio visible.
+        1. Devuelve una lista "offers".
+        2. IMPORTANTE: ELIMINA DUPLICADOS. Si ves 3 resultados de Amazon, quédate SOLO CON EL MEJOR (el que parezca ser el producto principal).
+        3. Solo 1 resultado por Dominio/Tienda.
+        4. Extrae precio si es visible (formato numérico). Si no, null.
+        5. Estandariza "seller" (ej: amazon.com.mx -> Amazon).
 
         OUTPUT JSON:
         {{
             "offers": [
-                {{ "title": "...", "price": 100.00, "currency": "MXN", "seller": "...", "link": "..." }}
+                {{ "title": "...", "price": 100.00, "currency": "MXN", "seller": "Amazon", "link": "..." }}
             ],
             "summary": "Resumen"
         }}
@@ -106,21 +126,26 @@ def _analyze_with_gemini(raw_items, upc):
         
         resp = model.generate_content(prompt)
         data = json.loads(resp.text)
-        return data.get("offers", []), data.get("summary", "")
+        
+        # Doble seguridad: Pasamos el filtro matemático también a lo que devolvió Gemini
+        # por si la IA alucinó y mandó duplicados de todas formas.
+        cleaned_offers = _deduplicate_by_domain(data.get("offers", []))
+        
+        return cleaned_offers, data.get("summary", "")
 
     except Exception as e:
         print(f"⚠️ Error Gemini: {e}")
-        # FALLBACK EN CASO DE ERROR DE IA
+        # FALLBACK POR ERROR
         fallback = []
         for r in raw_items:
             fallback.append({
                 "title": r['title'],
                 "price": None,
                 "currency": "MXN",
-                "seller": _extract_seller_from_url(r['link']),
+                "seller": _extract_domain(r['link']),
                 "link": r['link']
             })
-        return fallback, "Error IA (Fallback Activado)"
+        return _deduplicate_by_domain(fallback), "Error IA (Fallback Deduplicado)"
 
 # ===================== Handler =====================
 class handler(BaseHTTPRequestHandler):
@@ -132,9 +157,7 @@ class handler(BaseHTTPRequestHandler):
             query = data.get("query", "").strip()
             upc = _clean_upc(data.get("upc", ""))
             
-            # ESTRATEGIA "FRANKENSTEIN":
-            # 1. Buscamos el UPC + Nombre
-            # 2. Exigimos que tenga la palabra "precio" O que venga de sitios difíciles (Walmart/Aurrera)
+            # Query Híbrida
             forced_sites = "site:walmart.com.mx OR site:bodegaaurrera.com.mx OR site:super.walmart.com.mx"
             
             if query:
@@ -144,7 +167,7 @@ class handler(BaseHTTPRequestHandler):
             
             search_query = search_query.strip()
             
-            # 1. Traer datos crudos (Una sola vez)
+            # 1. Traer datos
             raw_results = _fetch_serpapi_organic(search_query)
             
             if not raw_results:
@@ -155,13 +178,13 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"organic_results": [], "gemini_summary": msg}).encode("utf-8"))
                 return
 
-            # 2. Procesar con IA (o Fallback automático si falla)
+            # 2. Procesar y Limpiar
             verified_items, summary = _analyze_with_gemini(raw_results, upc)
             
             payload = {
                 "organic_results": verified_items,
                 "gemini_summary": summary,
-                "powered_by": "serpapi-organic"
+                "powered_by": "serpapi-organic-deduplicated"
             }
 
             self.send_response(200)
