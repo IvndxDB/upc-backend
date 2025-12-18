@@ -13,17 +13,33 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Límites de validación
-PRICE_MIN = 10
-PRICE_MAX = 100000
+# Límites de validación (ajustados para productos baratos MX)
+PRICE_MIN = 1
+PRICE_MAX = 200000
 
 PRICE_PATTERNS = [
-    r'"offers"\s*:\s*{[^}]*?"price"\s*:\s*"?([0-9.,]+)"?',
+    # JSON estructurado (alta prioridad)
+    r'"offers"\s*:\s*\{[^}]*?"price"\s*:\s*"?([0-9.,]+)"?',
     r'"priceAmount"\s*:\s*"?([0-9.,]+)"?',
     r'"currentPrice"\s*:\s*"?([0-9.,]+)"?',
     r'"salePrice"\s*:\s*"?([0-9.,]+)"?',
+    r'"sellingPrice"\s*:\s*"?([0-9.,]+)"?',  # VTEX (Chedraui)
+    r'"lowPrice"\s*:\s*"?([0-9.,]+)"?',      # Schema.org
+    r'"precioVenta"\s*:\s*"?([0-9.,]+)"?',   # La Comer
+    r'"precio"\s*:\s*"?([0-9.,]+)"?',        # Genérico español
+
+    # Atributos HTML
     r'data-price\s*=\s*"?([0-9.,]+)"?',
-    r'\$\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)',
+    r'data-product-price\s*=\s*"?([0-9.,]+)"?',
+    r'itemprop="price"\s+content="([0-9.,]+)"',
+    r'content="([0-9.,]+)"\s+itemprop="price"',
+
+    # Clases CSS comunes en MX
+    r'class="[^"]*product-price[^"]*"[^>]*>\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)',
+    r'class="[^"]*precio[^"]*"[^>]*>\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)',
+
+    # Patrones de precio con símbolo
+    r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2}))',
     r'(?:precio|price)["\s:]*\$?\s*([0-9.,]+)'
 ]
 
